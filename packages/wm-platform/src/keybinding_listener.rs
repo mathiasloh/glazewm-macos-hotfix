@@ -72,6 +72,10 @@ pub struct KeybindingListener {
   /// A receiver channel for outgoing keybinding events.
   event_rx: mpsc::UnboundedReceiver<KeybindingEvent>,
 
+  /// Sender half of the event channel, retained for use when
+  /// restarting the keyboard hook.
+  event_tx: mpsc::UnboundedSender<KeybindingEvent>,
+
   /// A map of keybindings to their trigger key.
   ///
   /// The trigger key is the final key in a keybinding. For example, in
