@@ -85,14 +85,6 @@ impl ApplicationObserver {
       })?)
     };
 
-    let app_windows = Arc::new(Mutex::new(app.windows()?));
-    let context = Box::into_raw(Box::new(ApplicationEventContext {
-      application: app.clone(),
-      events_tx: events_tx.clone(),
-      app_windows: app_windows.clone(),
-      observer: observer.clone(),
-    }));
-
     let runloop =
       CFRunLoop::current().ok_or(crate::Error::EventLoopStopped)?;
 
@@ -100,6 +92,32 @@ impl ApplicationObserver {
     runloop.add_source(Some(&observer_source), unsafe {
       kCFRunLoopDefaultMode
     });
+
+    // Enumerate windows already present at observer creation time.
+    // This can transiently fail for applications whose accessibility
+    // hierarchy is not fully initialized (e.g. terminal emulators
+    // like WezTerm). Failures are treated as non-fatal: the observer is
+    // already registered, so `AXWindowCreated` will pick up any new
+    // windows as they become ready.
+    let app_windows = Arc::new(Mutex::new(match app.windows() {
+      Ok(windows) => windows,
+      Err(err) => {
+        tracing::warn!(
+          "Initial window enumeration failed for PID {}: {}. \
+           Falling back to notification-driven discovery.",
+          app.pid,
+          err,
+        );
+        Vec::new()
+      }
+    }));
+
+    let context = Box::into_raw(Box::new(ApplicationEventContext {
+      application: app.clone(),
+      events_tx: events_tx.clone(),
+      app_windows: app_windows.clone(),
+      observer: observer.clone(),
+    }));
 
     // Register for all window notifications.
     // TODO: Remove from runloop if registration fails.
