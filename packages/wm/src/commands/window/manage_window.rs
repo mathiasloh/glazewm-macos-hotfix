@@ -105,10 +105,14 @@ fn check_is_manageable(
 
     let role = native_window.role()?;
     let subrole = native_window.subrole()?;
-    let is_standard_window =
-      role == "AXWindow" && subrole == "AXStandardWindow";
+    let is_crossover_wine_helper =
+      native_window.is_crossover_wine_helper();
 
-    if !is_standard_window {
+    if !is_manageable_macos_window(
+      &role,
+      &subrole,
+      is_crossover_wine_helper,
+    ) {
       tracing::debug!(
         "Window {} not manageable: role={}, subrole={}.",
         native_window.id().0,
@@ -160,6 +164,17 @@ fn check_is_manageable(
   }
 
   Ok(Some(native_properties))
+}
+
+#[cfg(target_os = "macos")]
+fn is_manageable_macos_window(
+  role: &str,
+  subrole: &str,
+  is_crossover_wine_helper: bool,
+) -> bool {
+  role == "AXWindow"
+    && (subrole == "AXStandardWindow"
+      || (subrole == "AXUnknown" && is_crossover_wine_helper))
 }
 
 fn create_window(
@@ -364,4 +379,33 @@ fn insertion_target(
     focused_workspace.clone().into(),
     focused_workspace.child_count(),
   ))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn standard_ax_window_is_manageable() {
+    assert!(is_manageable_macos_window(
+      "AXWindow",
+      "AXStandardWindow",
+      false,
+    ));
+  }
+
+  #[test]
+  fn unknown_non_crossover_window_is_rejected() {
+    assert!(!is_manageable_macos_window("AXWindow", "AXUnknown", false,));
+  }
+
+  #[test]
+  fn unknown_crossover_window_is_manageable() {
+    assert!(is_manageable_macos_window("AXWindow", "AXUnknown", true,));
+  }
+
+  #[test]
+  fn unknown_non_window_role_is_rejected() {
+    assert!(!is_manageable_macos_window("AXButton", "AXUnknown", true,));
+  }
 }

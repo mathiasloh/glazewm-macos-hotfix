@@ -15,6 +15,46 @@ use crate::{
 
 pub type ProcessId = i32;
 
+const CROSSOVER_BUNDLE_IDS: &[&str] = &[
+  "com.codeweavers.CrossOver",
+  "com.codeweavers.CrossOverPreview",
+  "com.codeweavers.CrossOver-Preview",
+];
+
+const CROSSOVER_PROCESS_NAMES: &[&str] = &[
+  "CrossOver",
+  "CrossOver Helper",
+  "CrossOver Preview",
+  "CrossOver Preview Helper",
+];
+
+const WINE_HELPER_PROCESS_NAMES: &[&str] = &[
+  "wine",
+  "wine32",
+  "wine64",
+  "wine-preloader",
+  "wine32-preloader",
+  "wine64-preloader",
+  "wineserver",
+];
+
+/// Returns whether an application has a known CrossOver or Wine helper
+/// identity.
+fn is_crossover_wine_helper_identity(
+  bundle_id: Option<&str>,
+  process_name: Option<&str>,
+) -> bool {
+  bundle_id.is_some_and(|bundle_id| {
+    CROSSOVER_BUNDLE_IDS.contains(&bundle_id)
+      || bundle_id.starts_with("com.codeweavers.CrossOverHelper.")
+  }) || process_name.is_some_and(|process_name| {
+    CROSSOVER_PROCESS_NAMES
+      .iter()
+      .chain(WINE_HELPER_PROCESS_NAMES)
+      .any(|known_name| process_name.eq_ignore_ascii_case(known_name))
+  })
+}
+
 /// Represents a running macOS application.
 #[derive(Clone, Debug)]
 pub struct Application {
@@ -107,6 +147,15 @@ impl Application {
       .map(|ns_string| ns_string.to_string())
   }
 
+  /// Returns whether the application is a recognized CrossOver or Wine
+  /// helper.
+  pub(crate) fn is_crossover_wine_helper(&self) -> bool {
+    is_crossover_wine_helper_identity(
+      self.bundle_id().as_deref(),
+      self.process_name().as_deref(),
+    )
+  }
+
   /// Whether the application is an XPC service.
   ///
   /// Windows from XPC services are non-standard and cannot be managed.
@@ -143,6 +192,7 @@ impl Application {
   pub(crate) fn should_observe(&self) -> bool {
     if self.activation_policy()
       == NSApplicationActivationPolicy::Prohibited
+      && !self.is_crossover_wine_helper()
     {
       return false;
     }
@@ -185,4 +235,43 @@ pub(crate) fn application_for_bundle_id(
       .next()
       .map(|app| Application::new(app, dispatcher.clone()))
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn recognizes_crossover_bundle_ids() {
+    assert!(is_crossover_wine_helper_identity(
+      Some("com.codeweavers.CrossOver"),
+      Some("CrossOver"),
+    ));
+    assert!(is_crossover_wine_helper_identity(
+      Some("com.codeweavers.CrossOverPreview"),
+      Some("CrossOver Preview"),
+    ));
+    assert!(is_crossover_wine_helper_identity(
+      Some("com.codeweavers.CrossOverHelper.1234"),
+      Some("Steam"),
+    ));
+  }
+
+  #[test]
+  fn recognizes_wine_helper_process_names() {
+    assert!(is_crossover_wine_helper_identity(
+      None,
+      Some("wine64-preloader"),
+    ));
+    assert!(is_crossover_wine_helper_identity(None, Some("WINE")));
+  }
+
+  #[test]
+  fn rejects_unrecognized_processes() {
+    assert!(!is_crossover_wine_helper_identity(
+      Some("com.valvesoftware.steam"),
+      Some("steam.exe"),
+    ));
+    assert!(!is_crossover_wine_helper_identity(None, Some("helper")));
+  }
 }

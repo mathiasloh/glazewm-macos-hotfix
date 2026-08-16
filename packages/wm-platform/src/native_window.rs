@@ -71,6 +71,14 @@ pub trait NativeWindowExtMacOs {
   /// This method is only available on macOS.
   fn bundle_id(&self) -> Option<String>;
 
+  /// Returns whether the owning application is a recognized CrossOver or
+  /// Wine helper.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on macOS.
+  fn is_crossover_wine_helper(&self) -> bool;
+
   /// Gets the role of the window (e.g. `AXWindow`).
   ///
   /// # Platform-specific
@@ -108,6 +116,10 @@ impl NativeWindowExtMacOs for NativeWindow {
 
   fn bundle_id(&self) -> Option<String> {
     self.inner.application.bundle_id()
+  }
+
+  fn is_crossover_wine_helper(&self) -> bool {
+    self.inner.application.is_crossover_wine_helper()
   }
 
   fn role(&self) -> crate::Result<String> {

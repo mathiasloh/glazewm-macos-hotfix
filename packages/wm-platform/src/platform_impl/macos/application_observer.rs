@@ -1,6 +1,7 @@
 use std::{
   ptr::NonNull,
-  sync::{Arc, Mutex},
+  sync::{Arc, Condvar, Mutex},
+  time::Duration,
 };
 
 use objc2_application_services::{AXError, AXObserver, AXUIElement};
@@ -13,7 +14,7 @@ use crate::{
   platform_impl::{
     Application, NativeWindow, ProcessId, WindowEventNotificationInner,
   },
-  NativeWindowExtMacOs, ThreadBound, WindowEvent, WindowId,
+  Dispatcher, NativeWindowExtMacOs, ThreadBound, WindowEvent, WindowId,
 };
 
 /// Notifications to register for the `AXUIElement` of an application.
@@ -39,12 +40,96 @@ struct ApplicationEventContext {
   observer: CFRetained<AXObserver>,
 }
 
+/// Callback state that remains valid for the lifetime of the leaked
+/// callback context. The lifecycle is kept outside
+/// [`ApplicationEventContext`] so an operation can be acquired before the
+/// latter is accessed.
+#[derive(Debug)]
+struct ObserverCallbackContext {
+  lifecycle: Arc<ObserverLifecycle>,
+  context: ApplicationEventContext,
+}
+
+#[derive(Debug, Default)]
+struct ObserverLifecycleState {
+  cancelled: bool,
+  in_flight: usize,
+}
+
+/// Coordinates callbacks and delayed operations with observer teardown.
+#[derive(Debug)]
+struct ObserverLifecycle {
+  state: Mutex<ObserverLifecycleState>,
+  wake: Condvar,
+}
+
+#[derive(Debug)]
+struct ObserverOperation {
+  lifecycle: Arc<ObserverLifecycle>,
+}
+
+impl ObserverLifecycle {
+  fn new() -> Arc<Self> {
+    Arc::new(Self {
+      state: Mutex::new(ObserverLifecycleState::default()),
+      wake: Condvar::new(),
+    })
+  }
+
+  fn acquire(self: &Arc<Self>) -> Option<ObserverOperation> {
+    let mut state = self.state.lock().unwrap();
+    if state.cancelled {
+      return None;
+    }
+
+    state.in_flight += 1;
+    Some(ObserverOperation {
+      lifecycle: Arc::clone(self),
+    })
+  }
+
+  fn cancel(&self) {
+    let mut state = self.state.lock().unwrap();
+    state.cancelled = true;
+
+    if state.in_flight == 0 {
+      self.wake.notify_all();
+    }
+  }
+
+  fn wait_for_operations(&self) {
+    let mut state = self.state.lock().unwrap();
+
+    while state.in_flight > 0 {
+      state = self.wake.wait(state).unwrap();
+    }
+  }
+
+  fn cancel_and_wait(&self) {
+    self.cancel();
+    self.wait_for_operations();
+  }
+}
+
+impl Drop for ObserverOperation {
+  fn drop(&mut self) {
+    let mut state = self.lifecycle.state.lock().unwrap();
+    debug_assert!(state.in_flight > 0);
+    state.in_flight -= 1;
+
+    if state.in_flight == 0 {
+      self.lifecycle.wake.notify_all();
+    }
+  }
+}
+
 /// Represents an accessibility observer for a specific application.
 #[derive(Debug)]
 pub(crate) struct ApplicationObserver {
   pub(crate) pid: ProcessId,
   app_windows: Arc<Mutex<Vec<crate::NativeWindow>>>,
   events_tx: mpsc::UnboundedSender<WindowEvent>,
+  lifecycle: Arc<ObserverLifecycle>,
   _observer: CFRetained<AXObserver>,
   observer_source: CFRetained<CFRunLoopSource>,
 }
@@ -56,6 +141,14 @@ fn is_untracked_window(
   candidate_id: WindowId,
 ) -> bool {
   !tracked_ids.into_iter().any(|id| id == candidate_id)
+}
+
+/// Whether a failed initial AX window enumeration should be retried.
+fn should_retry_initial_window_enumeration(
+  is_crossover_wine_helper: bool,
+  initial_enumeration_succeeded: bool,
+) -> bool {
+  is_crossover_wine_helper && !initial_enumeration_succeeded
 }
 
 // TODO: Remove this.
@@ -108,24 +201,40 @@ impl ApplicationObserver {
     // like WezTerm). Failures are treated as non-fatal: the observer is
     // already registered, so `AXWindowCreated` will pick up any new
     // windows as they become ready.
-    let app_windows = Arc::new(Mutex::new(match app.windows() {
+    let is_crossover_wine_helper = app.is_crossover_wine_helper();
+    let initial_windows = app.windows();
+    let retry_initial_enumeration =
+      should_retry_initial_window_enumeration(
+        is_crossover_wine_helper,
+        initial_windows.is_ok(),
+      );
+    let app_windows = Arc::new(Mutex::new(match initial_windows {
       Ok(windows) => windows,
       Err(err) => {
         tracing::warn!(
           "Initial window enumeration failed for PID {}: {}. \
-           Falling back to notification-driven discovery.",
+           Falling back to notification-driven discovery{}.",
           app.pid,
           err,
+          if retry_initial_enumeration {
+            " and a delayed retry"
+          } else {
+            ""
+          },
         );
         Vec::new()
       }
     }));
 
-    let context = Box::into_raw(Box::new(ApplicationEventContext {
-      application: app.clone(),
-      events_tx: events_tx.clone(),
-      app_windows: app_windows.clone(),
-      observer: observer.clone(),
+    let lifecycle = ObserverLifecycle::new();
+    let context = Box::into_raw(Box::new(ObserverCallbackContext {
+      lifecycle: lifecycle.clone(),
+      context: ApplicationEventContext {
+        application: app.clone(),
+        events_tx: events_tx.clone(),
+        app_windows: app_windows.clone(),
+        observer: observer.clone(),
+      },
     }));
 
     // Register for all window notifications.
@@ -160,10 +269,22 @@ impl ApplicationObserver {
       }
     }
 
+    if retry_initial_enumeration {
+      Self::schedule_window_reenumeration(
+        context,
+        lifecycle.clone(),
+        app.dispatcher.clone(),
+        app.pid,
+        Duration::from_millis(500),
+        !is_startup,
+      );
+    }
+
     Ok(Self {
       pid: app.pid,
       app_windows,
       events_tx,
+      lifecycle,
       _observer: observer,
       observer_source,
     })
@@ -172,7 +293,7 @@ impl ApplicationObserver {
   fn register_app_notifications(
     app: &Application,
     observer: &CFRetained<AXObserver>,
-    context: *mut ApplicationEventContext,
+    context: *mut ObserverCallbackContext,
   ) -> crate::Result<()> {
     for notification in AX_APP_NOTIFICATIONS {
       unsafe {
@@ -198,7 +319,7 @@ impl ApplicationObserver {
   fn register_window_notifications(
     window: &crate::NativeWindow,
     observer: &CFRetained<AXObserver>,
-    context: *mut ApplicationEventContext,
+    context: *mut ObserverCallbackContext,
   ) -> crate::Result<()> {
     for notification in AX_WINDOW_NOTIFICATIONS {
       unsafe {
@@ -221,6 +342,10 @@ impl ApplicationObserver {
     }
 
     Ok(())
+  }
+
+  pub(crate) fn cancel_and_wait(&self) {
+    self.lifecycle.cancel_and_wait();
   }
 
   pub(crate) fn emit_all_windows_destroyed(&self) {
@@ -268,6 +393,113 @@ impl ApplicationObserver {
     }
   }
 
+  /// Re-enumerates windows after Accessibility has had time to initialize.
+  ///
+  /// The observer remains registered while this retry runs, so any window
+  /// created in the meantime is de-duplicated against `app_windows`.
+  fn schedule_window_reenumeration(
+    context: *mut ObserverCallbackContext,
+    lifecycle: Arc<ObserverLifecycle>,
+    dispatcher: Dispatcher,
+    pid: ProcessId,
+    delay: Duration,
+    emit_shown: bool,
+  ) {
+    // SAFETY: The callback context is heap-allocated via `Box::into_raw`
+    // and intentionally remains valid for the lifetime of the process.
+    let context_addr = context as usize;
+
+    std::thread::spawn(move || {
+      std::thread::sleep(delay);
+
+      // Acquire the lifecycle operation inside the event-loop closure. If
+      // dispatching fails during shutdown, the closure is never run and no
+      // operation is left for teardown to wait on.
+      let result = dispatcher.dispatch_async(move || {
+        let Some(_operation) = lifecycle.acquire() else {
+          return;
+        };
+
+        // SAFETY: The callback context is intentionally leaked and
+        // therefore remains valid. The operation guard prevents
+        // teardown from invalidating the observer while its nested
+        // context is accessed.
+        let callback_context =
+          unsafe { &*(context_addr as *const ObserverCallbackContext) };
+        let context = &callback_context.context;
+        let current_windows = match context.application.windows() {
+          Ok(windows) => windows,
+          Err(err) => {
+            tracing::debug!(
+              "Window re-enumeration failed for PID {}: {}",
+              pid,
+              err,
+            );
+            return;
+          }
+        };
+
+        let mut tracked = context.app_windows.lock().unwrap();
+
+        for new_window in current_windows {
+          if !is_untracked_window(
+            tracked.iter().map(crate::NativeWindow::id),
+            new_window.id(),
+          ) {
+            continue;
+          }
+
+          // WindowServer is authoritative for whether the native ID still
+          // belongs to this application.
+          if !new_window.is_valid() {
+            tracing::debug!(
+              "Skipping WindowServer-invalid window {} for PID {}.",
+              new_window.id().0,
+              pid,
+            );
+            continue;
+          }
+
+          tracing::info!(
+            "Re-discovered window {} for PID {}.",
+            new_window.id().0,
+            pid,
+          );
+
+          tracked.push(new_window.clone());
+
+          if let Err(err) = Self::register_window_notifications(
+            &new_window,
+            &context.observer,
+            context_addr as *mut ObserverCallbackContext,
+          ) {
+            tracing::warn!(
+              "Failed to register window notifications for re-discovered \
+               window {}: {}",
+              new_window.id().0,
+              err,
+            );
+          }
+
+          if emit_shown {
+            let _ = context.events_tx.send(WindowEvent::Shown {
+              window: new_window,
+              notification: crate::WindowEventNotification(None),
+            });
+          }
+        }
+      });
+
+      if let Err(err) = result {
+        tracing::debug!(
+          "Failed to dispatch window re-enumeration for PID {}: {}",
+          pid,
+          err,
+        );
+      }
+    });
+  }
+
   /// Callback function for accessibility window events.
   #[allow(clippy::too_many_lines)]
   unsafe extern "C-unwind" fn window_event_callback(
@@ -281,7 +513,19 @@ impl ApplicationObserver {
       return;
     }
 
-    let context = &mut *context.cast::<ApplicationEventContext>();
+    let callback_context_ptr = context.cast::<ObserverCallbackContext>();
+    // The outer callback context is intentionally leaked, so reading its
+    // lifecycle handle is safe even when teardown has already started.
+    let lifecycle = unsafe { (*callback_context_ptr).lifecycle.clone() };
+    let Some(_operation) = lifecycle.acquire() else {
+      return;
+    };
+
+    // The operation guard now covers all access to the nested application
+    // context, including tracking, notification registration, and
+    // emission.
+    let callback_context = unsafe { &*callback_context_ptr };
+    let context = &callback_context.context;
     let ax_element = unsafe { CFRetained::retain(element) };
     let notification = WindowEventNotificationInner {
       name: notification_name.as_ref().to_string(),
@@ -328,101 +572,14 @@ impl ApplicationObserver {
         // to catch replacements whose `AXWindowCreated` notification
         // was missed (e.g. Spotify rapidly destroys and recreates its
         // window on launch).
-        //
-        // The re-enumeration is dispatched back to the event loop
-        // thread so that AX notifications can be registered for any
-        // newly discovered windows.
-
-        // SAFETY: The `ApplicationEventContext` is heap-allocated via
-        // `Box::into_raw` and lives for the lifetime of the
-        // `ApplicationObserver`. Passing the address as `usize` keeps
-        // the closure `Send`.
-        let context_addr =
-          std::ptr::from_ref::<ApplicationEventContext>(context) as usize;
-        let dispatcher = context.application.dispatcher.clone();
-        let pid = context.application.pid;
-
-        std::thread::spawn(move || {
-          std::thread::sleep(std::time::Duration::from_millis(500));
-
-          let result = dispatcher.dispatch_sync(move || {
-            // SAFETY: See comment above — pointer is stable and the
-            // closure runs on the event loop thread.
-            let context = unsafe {
-              &*(context_addr as *const ApplicationEventContext)
-            };
-
-            let current_windows = match context.application.windows() {
-              Ok(w) => w,
-              Err(err) => {
-                tracing::debug!(
-                  "Re-enumeration failed for PID {}: {}",
-                  pid,
-                  err,
-                );
-                return;
-              }
-            };
-
-            let mut tracked = context.app_windows.lock().unwrap();
-
-            for new_window in current_windows {
-              if !is_untracked_window(
-                tracked.iter().map(crate::NativeWindow::id),
-                new_window.id(),
-              ) {
-                continue;
-              }
-
-              // AX can retain a destroyed element long enough for the
-              // delayed scan to return it. WindowServer is
-              // authoritative for whether the native ID
-              // still belongs to this application.
-              if !new_window.is_valid() {
-                tracing::debug!(
-                  "Skipping WindowServer-invalid window {} for PID {}.",
-                  new_window.id().0,
-                  pid,
-                );
-                continue;
-              }
-
-              tracing::info!(
-                "Re-discovered window {} for PID {} after destroy.",
-                new_window.id().0,
-                pid,
-              );
-
-              tracked.push(new_window.clone());
-
-              if let Err(err) = Self::register_window_notifications(
-                &new_window,
-                &context.observer,
-                context_addr as *mut ApplicationEventContext,
-              ) {
-                tracing::warn!(
-                  "Failed to register notifications for \
-                   re-discovered window {}: {}",
-                  new_window.id().0,
-                  err,
-                );
-              }
-
-              let _ = context.events_tx.send(WindowEvent::Shown {
-                window: new_window,
-                notification: crate::WindowEventNotification(None),
-              });
-            }
-          });
-
-          if let Err(err) = result {
-            tracing::debug!(
-              "Failed to dispatch re-enumeration for PID {}: {}",
-              pid,
-              err,
-            );
-          }
-        });
+        Self::schedule_window_reenumeration(
+          callback_context_ptr,
+          lifecycle.clone(),
+          context.application.dispatcher.clone(),
+          context.application.pid,
+          Duration::from_millis(500),
+          true,
+        );
       }
 
       return;
@@ -443,8 +600,8 @@ impl ApplicationObserver {
       context.app_windows.lock().unwrap().push(window.clone());
       let _ = Self::register_window_notifications(
         &window,
-        &context.observer.clone(),
-        context,
+        &context.observer,
+        callback_context_ptr,
       );
 
       if let Err(err) = context.events_tx.send(WindowEvent::Shown {
@@ -506,7 +663,10 @@ impl ApplicationObserver {
 
 impl Drop for ApplicationObserver {
   fn drop(&mut self) {
-    // Invalidate the runloop source. This is thread-safe and is OK to call
+    self.cancel_and_wait();
+
+    // Invalidate the runloop source after all callbacks and detached
+    // operations have finished. This is thread-safe and is OK to call
     // after the run loop is stopped.
     self.observer_source.invalidate();
   }
@@ -522,5 +682,35 @@ mod tests {
 
     assert!(!is_untracked_window([WindowId(42)], candidate_id));
     assert!(is_untracked_window([WindowId(7)], candidate_id));
+  }
+
+  #[test]
+  fn initial_enumeration_retry_is_scoped_to_crossover_helpers() {
+    assert!(should_retry_initial_window_enumeration(true, false));
+    assert!(!should_retry_initial_window_enumeration(false, false));
+    assert!(!should_retry_initial_window_enumeration(true, true));
+  }
+
+  #[test]
+  fn lifecycle_rejects_operations_after_cancellation() {
+    let lifecycle = ObserverLifecycle::new();
+
+    lifecycle.cancel_and_wait();
+
+    assert!(lifecycle.acquire().is_none());
+  }
+
+  #[test]
+  fn lifecycle_waits_for_and_releases_in_flight_operations() {
+    let lifecycle = ObserverLifecycle::new();
+    let operation = lifecycle.acquire().unwrap();
+    lifecycle.cancel();
+
+    assert!(lifecycle.acquire().is_none());
+    drop(operation);
+
+    // Waiting after the guard is released must return immediately.
+    lifecycle.wait_for_operations();
+    lifecycle.cancel_and_wait();
   }
 }

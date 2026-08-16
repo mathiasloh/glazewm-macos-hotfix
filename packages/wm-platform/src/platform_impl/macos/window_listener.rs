@@ -31,6 +31,16 @@ pub(crate) struct WindowListener {
   observer: Option<ThreadBound<Retained<NotificationObserver>>>,
 }
 
+/// Returns whether a workspace event needs a new application observer.
+fn should_create_application_observer(
+  observed_pids: impl IntoIterator<Item = ProcessId>,
+  pid: ProcessId,
+) -> bool {
+  !observed_pids
+    .into_iter()
+    .any(|observed_pid| observed_pid == pid)
+}
+
 impl WindowListener {
   /// Implements [`WindowListener::new`].
   pub(crate) fn new(
@@ -129,6 +139,18 @@ impl WindowListener {
 
       match event {
         NotificationEvent::WorkspaceDidLaunchApplication(running_app) => {
+          let pid = running_app.processIdentifier();
+          if !should_create_application_observer(
+            app_observers.keys().copied(),
+            pid,
+          ) {
+            tracing::debug!(
+              "Observer already exists for launched PID {}.",
+              pid
+            );
+            continue;
+          }
+
           let events_tx = events_tx.clone();
 
           let Ok(Ok(app_observer)) = dispatcher.dispatch_sync(|| {
@@ -145,14 +167,6 @@ impl WindowListener {
             continue;
           };
 
-          if app_observers.contains_key(&app_observer.pid) {
-            tracing::debug!(
-              "Observer already exists for PID {}.",
-              app_observer.pid
-            );
-            continue;
-          }
-
           app_observers.insert(app_observer.pid, app_observer);
         }
         NotificationEvent::WorkspaceDidTerminateApplication(
@@ -166,6 +180,7 @@ impl WindowListener {
               pid
             );
 
+            observer.cancel_and_wait();
             observer.emit_all_windows_destroyed();
           }
         }
@@ -254,5 +269,16 @@ impl WindowListener {
 impl Drop for WindowListener {
   fn drop(&mut self) {
     self.terminate();
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn duplicate_launch_does_not_create_an_observer() {
+    assert!(!should_create_application_observer([42], 42));
+    assert!(should_create_application_observer([42], 7));
   }
 }
