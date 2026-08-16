@@ -3,7 +3,12 @@
 //! Available via the `test_utils` Cargo feature.
 use std::sync::{atomic::AtomicBool, Arc};
 
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSRunningApplication;
+
 use crate::platform_impl;
+#[cfg(target_os = "macos")]
+use crate::ThreadBound;
 #[cfg(target_os = "macos")]
 pub use crate::WindowId;
 pub use crate::{Dispatcher, Display, NativeWindow};
@@ -30,13 +35,21 @@ impl NativeWindow {
     }
     #[cfg(target_os = "macos")]
     {
-      #[allow(invalid_value)]
-      platform_impl::NativeWindow::new(
-        WindowId(0),
-        unsafe { std::mem::zeroed() },
-        unsafe { std::mem::zeroed() },
-      )
-      .into()
+      let dispatcher = Dispatcher::mock();
+      let application = platform_impl::Application::new(
+        NSRunningApplication::currentApplication(),
+        dispatcher.clone(),
+      );
+      let element = ThreadBound::new(
+        // SAFETY: `AXUIElement::new_system_wide` returns a retained
+        // system accessibility element suitable for a test
+        // fixture.
+        unsafe { platform_impl::AXUIElement::new_system_wide() },
+        dispatcher,
+      );
+
+      platform_impl::NativeWindow::new(WindowId(0), element, application)
+        .into()
     }
   }
 }

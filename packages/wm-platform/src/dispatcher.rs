@@ -443,7 +443,10 @@ impl Dispatcher {
   #[must_use]
   pub fn thread_id(&self) -> ThreadId {
     // TODO: Block until event loop source is set.
-    self.source.as_ref().unwrap().thread_id
+    self.source.as_ref().map_or_else(
+      || std::thread::current().id(),
+      |source| source.thread_id,
+    )
   }
 
   /// Gets whether the current thread is the event loop thread.

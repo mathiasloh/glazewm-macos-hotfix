@@ -49,6 +49,15 @@ pub(crate) struct ApplicationObserver {
   observer_source: CFRetained<CFRunLoopSource>,
 }
 
+/// Returns whether a rediscovered native window is absent from the
+/// tracker.
+fn is_untracked_window(
+  tracked_ids: impl IntoIterator<Item = WindowId>,
+  candidate_id: WindowId,
+) -> bool {
+  !tracked_ids.into_iter().any(|id| id == candidate_id)
+}
+
 // TODO: Remove this.
 unsafe impl Send for ApplicationObserver {}
 
@@ -358,7 +367,23 @@ impl ApplicationObserver {
             let mut tracked = context.app_windows.lock().unwrap();
 
             for new_window in current_windows {
-              if tracked.iter().any(|w| w.id() == new_window.id()) {
+              if !is_untracked_window(
+                tracked.iter().map(crate::NativeWindow::id),
+                new_window.id(),
+              ) {
+                continue;
+              }
+
+              // AX can retain a destroyed element long enough for the
+              // delayed scan to return it. WindowServer is
+              // authoritative for whether the native ID
+              // still belongs to this application.
+              if !new_window.is_valid() {
+                tracing::debug!(
+                  "Skipping WindowServer-invalid window {} for PID {}.",
+                  new_window.id().0,
+                  pid,
+                );
                 continue;
               }
 
@@ -484,5 +509,18 @@ impl Drop for ApplicationObserver {
     // Invalidate the runloop source. This is thread-safe and is OK to call
     // after the run loop is stopped.
     self.observer_source.invalidate();
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn rediscovered_window_is_only_tracked_once() {
+    let candidate_id = WindowId(42);
+
+    assert!(!is_untracked_window([WindowId(42)], candidate_id));
+    assert!(is_untracked_window([WindowId(7)], candidate_id));
   }
 }

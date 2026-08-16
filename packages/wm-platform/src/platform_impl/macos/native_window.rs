@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ffi::c_void, sync::Arc};
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
@@ -6,16 +6,189 @@ use objc2_app_kit::{
 };
 use objc2_application_services::{AXError, AXValue};
 use objc2_core_foundation::{
-  CFBoolean, CFRetained, CFString, CGPoint, CGSize,
+  CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CGPoint, CGSize,
 };
-use objc2_core_graphics::{CGDisplayIsAsleep, CGError};
+use objc2_core_graphics::{
+  kCGWindowNumber, kCGWindowOwnerPID, CGDisplayIsAsleep, CGError,
+  CGWindowListCopyWindowInfo, CGWindowListOption,
+};
 
 use crate::{
   platform_impl::{
     self, ffi, AXUIElement, AXUIElementExt, AXValueExt, Application,
+    ProcessId,
   },
   Dispatcher, Point, Rect, ThreadBound, WindowId,
 };
+
+/// Result of checking a native window ID against WindowServer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowServerPresence {
+  Present,
+  Missing,
+  OwnerMismatch,
+  Unavailable,
+}
+
+/// Window identity data returned by WindowServer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowServerWindow {
+  id: WindowId,
+  owner_pid: ProcessId,
+}
+
+/// Determines whether a WindowServer lookup result is safe to keep
+/// managed.
+fn is_valid_window_server_presence(
+  presence: WindowServerPresence,
+  is_system_transitioning: bool,
+) -> bool {
+  match presence {
+    WindowServerPresence::Present | WindowServerPresence::Unavailable => {
+      true
+    }
+    WindowServerPresence::Missing
+    | WindowServerPresence::OwnerMismatch => is_system_transitioning,
+  }
+}
+
+/// Classifies the WindowServer records for a specific native window.
+fn classify_window_server_presence(
+  windows: impl IntoIterator<Item = WindowServerWindow>,
+  window_id: WindowId,
+  owner_pid: ProcessId,
+) -> WindowServerPresence {
+  let mut has_owner_mismatch = false;
+
+  for window in windows {
+    if window.id != window_id {
+      continue;
+    }
+
+    if window.owner_pid == owner_pid {
+      return WindowServerPresence::Present;
+    }
+
+    has_owner_mismatch = true;
+  }
+
+  if has_owner_mismatch {
+    WindowServerPresence::OwnerMismatch
+  } else {
+    WindowServerPresence::Missing
+  }
+}
+
+/// Returns the WindowServer query options used for window validity checks.
+///
+/// `OptionIncludingWindow` intentionally omits `OptionOnScreenOnly`, so
+/// windows that are hidden, off-screen, minimized, or on another Space
+/// remain visible to the probe.
+fn window_server_query_options() -> CGWindowListOption {
+  CGWindowListOption::OptionIncludingWindow
+}
+
+/// Gets a numeric value from a WindowServer window description.
+fn window_description_number<'a>(
+  description: &'a CFDictionary,
+  key: &'static CFString,
+) -> Option<&'a CFNumber> {
+  let value = unsafe {
+    // SAFETY: `description` is a valid WindowServer dictionary and `key`
+    // is a framework-provided CFString.
+    description.value(std::ptr::from_ref(key).cast::<c_void>())
+  };
+
+  // SAFETY: CoreGraphics documents these numeric fields as `CFNumber`
+  // values; a null pointer is handled by `as_ref`.
+  unsafe { value.cast::<CFNumber>().as_ref() }
+}
+
+/// Queries whether WindowServer still owns a native window ID for a
+/// process.
+fn window_server_presence(
+  window_id: WindowId,
+  owner_pid: ProcessId,
+) -> WindowServerPresence {
+  let Some(window_descriptions) =
+    CGWindowListCopyWindowInfo(window_server_query_options(), window_id.0)
+  else {
+    return WindowServerPresence::Unavailable;
+  };
+
+  let window_descriptions = (&*window_descriptions).as_opaque();
+  let mut windows = Vec::new();
+  let mut has_malformed_target = false;
+
+  for index in 0..window_descriptions.count() {
+    let description = unsafe {
+      // SAFETY: `CGWindowListCopyWindowInfo` returns dictionaries in its
+      // window-description array; a null entry is handled by `as_ref`.
+      window_descriptions
+        .value_at_index(index)
+        .cast::<CFDictionary>()
+        .as_ref()
+    };
+    let Some(description) = description else {
+      continue;
+    };
+
+    let window_number = unsafe {
+      // SAFETY: `kCGWindowNumber` is a framework-provided constant.
+      window_description_number(description, kCGWindowNumber)
+    };
+    let Some(id) = window_number
+      .and_then(|number| number.as_i64())
+      .and_then(|id| u32::try_from(id).ok())
+      .map(WindowId)
+    else {
+      continue;
+    };
+
+    if id != window_id {
+      continue;
+    }
+
+    let owner_pid = unsafe {
+      // SAFETY: `kCGWindowOwnerPID` is a framework-provided constant.
+      window_description_number(description, kCGWindowOwnerPID)
+    };
+    let Some(owner_pid) = owner_pid.and_then(|number| number.as_i32())
+    else {
+      has_malformed_target = true;
+      continue;
+    };
+
+    windows.push(WindowServerWindow { id, owner_pid });
+  }
+
+  if has_malformed_target {
+    return WindowServerPresence::Unavailable;
+  }
+
+  classify_window_server_presence(windows, window_id, owner_pid)
+}
+
+/// Returns whether macOS is transitioning between the active and login
+/// sessions.
+fn is_system_transitioning() -> bool {
+  let has_login_window = NSWorkspace::sharedWorkspace()
+    .frontmostApplication()
+    .and_then(|app| app.bundleIdentifier())
+    .is_some_and(|id| id.to_string() == "com.apple.loginwindow");
+
+  // AX calls transiently fail with `InvalidUIElement` during sleep/wake.
+  //
+  // Events during sleep:
+  //   1. Display goes asleep.
+  //   2. AX calls fail with `InvalidUIElement`.
+  //   3. Login window activates.
+  //
+  // Events during wake:
+  //   1. Display wakes up.
+  //   2. Login window deactivates and AX calls succeed again.
+  CGDisplayIsAsleep(0) || has_login_window
+}
 
 /// Platform-specific implementation of [`NativeWindow`].
 #[derive(Clone, Debug)]
@@ -98,36 +271,13 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::is_valid`].
   pub(crate) fn is_valid(&self) -> bool {
-    // Query `AXRole`, which is present on all valid `AXUIElement`s.
-    self
-      .element
-      .with(|el| match el.get_attribute::<CFString>("AXRole") {
-        Err(crate::Error::Accessibility(_, code))
-          if code == AXError::InvalidUIElement.0 =>
-        {
-          let has_login_window = NSWorkspace::sharedWorkspace()
-            .frontmostApplication()
-            .and_then(|app| app.bundleIdentifier())
-            .is_some_and(|id| id.to_string() == "com.apple.loginwindow");
+    let presence = window_server_presence(self.id, self.application.pid);
+    let is_system_transitioning = matches!(
+      presence,
+      WindowServerPresence::Missing | WindowServerPresence::OwnerMismatch
+    ) && is_system_transitioning();
 
-          // AX calls transiently fail with `InvalidUIElement` during
-          // sleep/wake. The window should still be considered valid.
-          //
-          // Events during sleep:
-          //   1. Display goes asleep.
-          //   2. AX calls fail with `InvalidUIElement`.
-          //   3. Login window activates.
-          //
-          // Events during wake:
-          //   1. Display wakes up.
-          //   2. Login window deactivates and AX calls succeed again.
-          //
-          // Perf: `CGDisplayIsAsleep` ~1-5µs, login window check ~1-2ms.
-          CGDisplayIsAsleep(0) || has_login_window
-        }
-        _ => true,
-      })
-      .unwrap_or(false)
+    is_valid_window_server_presence(presence, is_system_transitioning)
   }
 
   /// Implements [`NativeWindow::is_visible`].
@@ -381,6 +531,94 @@ impl NativeWindow {
     }
 
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn present_window_is_valid() {
+    assert!(is_valid_window_server_presence(
+      WindowServerPresence::Present,
+      false,
+    ));
+  }
+
+  #[test]
+  fn missing_window_is_invalid_during_active_session() {
+    assert!(!is_valid_window_server_presence(
+      WindowServerPresence::Missing,
+      false,
+    ));
+  }
+
+  #[test]
+  fn owner_mismatch_is_invalid_during_active_session() {
+    assert!(!is_valid_window_server_presence(
+      WindowServerPresence::OwnerMismatch,
+      false,
+    ));
+  }
+
+  #[test]
+  fn unavailable_window_server_is_kept() {
+    assert!(is_valid_window_server_presence(
+      WindowServerPresence::Unavailable,
+      false,
+    ));
+  }
+
+  #[test]
+  fn session_transition_keeps_missing_windows() {
+    assert!(is_valid_window_server_presence(
+      WindowServerPresence::Missing,
+      true,
+    ));
+    assert!(is_valid_window_server_presence(
+      WindowServerPresence::OwnerMismatch,
+      true,
+    ));
+  }
+
+  #[test]
+  fn matching_window_server_record_is_present() {
+    let window_id = WindowId(42);
+    let presence = classify_window_server_presence(
+      [WindowServerWindow {
+        id: window_id,
+        owner_pid: 123,
+      }],
+      window_id,
+      123,
+    );
+
+    assert_eq!(presence, WindowServerPresence::Present);
+  }
+
+  #[test]
+  fn mismatched_window_server_record_is_owner_mismatch() {
+    let window_id = WindowId(42);
+    let presence = classify_window_server_presence(
+      [WindowServerWindow {
+        id: window_id,
+        owner_pid: 456,
+      }],
+      window_id,
+      123,
+    );
+
+    assert_eq!(presence, WindowServerPresence::OwnerMismatch);
+  }
+
+  #[test]
+  fn including_window_probe_keeps_hidden_and_off_screen_windows_eligible()
+  {
+    let options = window_server_query_options();
+
+    assert!(options.contains(CGWindowListOption::OptionIncludingWindow));
+    assert!(!options.contains(CGWindowListOption::OptionOnScreenOnly));
   }
 }
 

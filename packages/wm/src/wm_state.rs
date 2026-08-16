@@ -675,10 +675,24 @@ impl WmState {
   ///
   /// See: <https://github.com/glzr-io/glazewm/issues/1219>
   pub fn cleanup_invalid_windows(&mut self) -> anyhow::Result<()> {
+    self.cleanup_invalid_windows_with(|window| window.native().is_valid())
+  }
+
+  /// Cleans up windows using a caller-provided validity predicate.
+  ///
+  /// The predicate is an internal test seam; production callers should use
+  /// [`Self::cleanup_invalid_windows`].
+  fn cleanup_invalid_windows_with<F>(
+    &mut self,
+    is_valid: F,
+  ) -> anyhow::Result<()>
+  where
+    F: Fn(&WindowContainer) -> bool,
+  {
     let invalid_windows = self
       .windows()
       .into_iter()
-      .filter(|window| !window.native().is_valid());
+      .filter(|window| !is_valid(window));
 
     for window in invalid_windows {
       tracing::info!("Removing invalid window: {}", window);
@@ -689,6 +703,92 @@ impl WmState {
     self.ignored_windows.retain(NativeWindow::is_valid);
 
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use tokio::sync::mpsc;
+  use wm_common::WmEvent;
+  use wm_platform::Dispatcher;
+
+  use super::*;
+  use crate::{
+    commands::container::attach_container,
+    models::{Container, TilingWindow, Workspace},
+  };
+
+  fn state_with_one_tiling_window(
+  ) -> (WmState, mpsc::UnboundedReceiver<WmEvent>) {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _) = mpsc::unbounded_channel();
+    let (restart_keybinding_tx, _) = mpsc::unbounded_channel();
+    let mut state = WmState::new(
+      Dispatcher::mock(),
+      event_tx,
+      exit_tx,
+      restart_keybinding_tx,
+    );
+
+    let window = TilingWindow::mock().call();
+    let workspace = Workspace::mock()
+      .tiling_containers(vec![window.into()])
+      .call();
+    let workspace: Container = workspace.into();
+    let root: Container = state.root_container.clone().into();
+
+    assert!(attach_container(&workspace, &root, None).is_ok());
+    state.has_initialized = true;
+
+    (state, event_rx)
+  }
+
+  #[test]
+  fn cleanup_invalid_windows_removes_missing_window() {
+    let (mut state, mut events) = state_with_one_tiling_window();
+
+    let result = state.cleanup_invalid_windows_with(|_| false);
+    assert!(result.is_ok(), "{result:?}");
+
+    assert!(state.windows().is_empty());
+    assert!(matches!(
+      events.try_recv(),
+      Ok(WmEvent::WindowUnmanaged {
+        unmanaged_handle: 0,
+        ..
+      })
+    ));
+  }
+
+  #[test]
+  fn cleanup_invalid_windows_retains_present_and_unknown_windows() {
+    let (mut state, mut events) = state_with_one_tiling_window();
+
+    assert!(state.cleanup_invalid_windows_with(|_| true).is_ok());
+
+    assert_eq!(state.windows().len(), 1);
+    assert!(events.try_recv().is_err());
+
+    // Remove the mock before `WmState::drop` tries to redraw it.
+    let result = state.cleanup_invalid_windows_with(|_| false);
+    assert!(result.is_ok(), "{result:?}");
+  }
+
+  #[test]
+  fn cleanup_invalid_windows_is_idempotent() {
+    let (mut state, mut events) = state_with_one_tiling_window();
+
+    let first_result = state.cleanup_invalid_windows_with(|_| false);
+    assert!(first_result.is_ok(), "{first_result:?}");
+    let second_result = state.cleanup_invalid_windows_with(|_| false);
+    assert!(second_result.is_ok(), "{second_result:?}");
+
+    assert!(state.windows().is_empty());
+    assert!(matches!(
+      events.try_recv(),
+      Ok(WmEvent::WindowUnmanaged { .. })
+    ));
+    assert!(events.try_recv().is_err());
   }
 }
 
