@@ -79,13 +79,19 @@ fn classify_window_server_presence(
   }
 }
 
-/// Returns the WindowServer query options used for window validity checks.
+/// Returns the WindowServer query options and relative window ID.
 ///
-/// `OptionIncludingWindow` intentionally omits `OptionOnScreenOnly`, so
-/// windows that are hidden, off-screen, minimized, or on another Space
-/// remain visible to the probe.
-fn window_server_query_options() -> CGWindowListOption {
-  CGWindowListOption::OptionIncludingWindow
+/// Inactive native tabs require `OptionAll`, whose API contract requires
+/// `kCGNullWindowID` (0). The candidate ID remains separate for filtering.
+fn window_server_query_arguments(
+  window_id: WindowId,
+  include_inactive_tabs: bool,
+) -> (CGWindowListOption, u32) {
+  if include_inactive_tabs {
+    (CGWindowListOption::OptionAll, 0)
+  } else {
+    (CGWindowListOption::OptionIncludingWindow, window_id.0)
+  }
 }
 
 /// Gets a numeric value from a WindowServer window description.
@@ -109,9 +115,12 @@ fn window_description_number<'a>(
 fn window_server_presence(
   window_id: WindowId,
   owner_pid: ProcessId,
+  include_inactive_tabs: bool,
 ) -> WindowServerPresence {
+  let (options, relative_window_id) =
+    window_server_query_arguments(window_id, include_inactive_tabs);
   let Some(window_descriptions) =
-    CGWindowListCopyWindowInfo(window_server_query_options(), window_id.0)
+    CGWindowListCopyWindowInfo(options, relative_window_id)
   else {
     return WindowServerPresence::Unavailable;
   };
@@ -271,7 +280,24 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::is_valid`].
   pub(crate) fn is_valid(&self) -> bool {
-    let presence = window_server_presence(self.id, self.application.pid);
+    self.has_window_server_presence(false)
+  }
+
+  /// Implements [`crate::NativeWindowExtMacOs::is_alive`].
+  pub(crate) fn is_alive(&self) -> bool {
+    self.has_window_server_presence(true)
+  }
+
+  /// Checks native identity, optionally including inactive native tabs.
+  fn has_window_server_presence(
+    &self,
+    include_inactive_tabs: bool,
+  ) -> bool {
+    let presence = window_server_presence(
+      self.id,
+      self.application.pid,
+      include_inactive_tabs,
+    );
     let is_system_transitioning = matches!(
       presence,
       WindowServerPresence::Missing | WindowServerPresence::OwnerMismatch
@@ -615,10 +641,24 @@ mod tests {
   #[test]
   fn including_window_probe_keeps_hidden_and_off_screen_windows_eligible()
   {
-    let options = window_server_query_options();
+    let (options, _) = window_server_query_arguments(WindowId(42), false);
 
     assert!(options.contains(CGWindowListOption::OptionIncludingWindow));
     assert!(!options.contains(CGWindowListOption::OptionOnScreenOnly));
+  }
+
+  /// All-window queries require a null relative ID, not the candidate ID.
+  #[test]
+  fn lifetime_and_managed_queries_use_the_required_relative_window_ids() {
+    let candidate_id = WindowId(42);
+    assert_eq!(
+      window_server_query_arguments(candidate_id, true),
+      (CGWindowListOption::OptionAll, 0),
+    );
+    assert_eq!(
+      window_server_query_arguments(candidate_id, false),
+      (CGWindowListOption::OptionIncludingWindow, candidate_id.0),
+    );
   }
 }
 

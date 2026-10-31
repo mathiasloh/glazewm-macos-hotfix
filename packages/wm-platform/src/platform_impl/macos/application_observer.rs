@@ -12,7 +12,8 @@ use tokio::sync::mpsc;
 
 use crate::{
   platform_impl::{
-    Application, NativeWindow, ProcessId, WindowEventNotificationInner,
+    AXUIElementExt, Application, NativeWindow, ProcessId,
+    WindowEventNotificationInner,
   },
   Dispatcher, NativeWindowExtMacOs, ThreadBound, WindowEvent, WindowId,
 };
@@ -141,6 +142,19 @@ fn is_untracked_window(
   candidate_id: WindowId,
 ) -> bool {
   !tracked_ids.into_iter().any(|id| id == candidate_id)
+}
+
+/// Runs notification admission effects only for actual AX windows.
+///
+/// Descendants such as Finder tab buttons can share a window's CG ID.
+fn with_window_notification_target<T>(
+  role: crate::Result<CFRetained<CFString>>,
+  admit: impl FnOnce() -> T,
+) -> Option<T> {
+  role
+    .ok()
+    .filter(|role| role.to_string() == "AXWindow")
+    .map(|_| admit())
 }
 
 /// Whether a failed initial AX window enumeration should be retried.
@@ -538,18 +552,18 @@ impl ApplicationObserver {
       context.application.pid
     );
 
-    let found_window = {
-      let app_windows = context.app_windows.lock().unwrap();
-
-      app_windows
+    if notification.name.as_str() == "AXUIElementDestroyed" {
+      // Destroyed elements may no longer answer attribute queries.
+      let found_window = context
+        .app_windows
+        .lock()
+        .unwrap()
         .iter()
         .find(|window| {
           window.ax_ui_element().get_ref().ok() == Some(&ax_element)
         })
-        .cloned()
-    };
+        .cloned();
 
-    if notification.name.as_str() == "AXUIElementDestroyed" {
       if let Some(window) = &found_window {
         context
           .app_windows
@@ -585,38 +599,78 @@ impl ApplicationObserver {
       return;
     }
 
-    let is_new_window = found_window.is_none();
-    let window = found_window.unwrap_or_else(|| {
-      let window_id = WindowId::from_window_element(&ax_element);
-      let ax_element = ThreadBound::new(
-        ax_element,
-        context.application.dispatcher.clone(),
-      );
-      NativeWindow::new(window_id, ax_element, context.application.clone())
-        .into()
-    });
+    // Focus notifications can name the application rather than its window.
+    let ax_element = if notification.name == "AXFocusedWindowChanged"
+      && ax_element
+        .get_attribute::<CFString>("AXRole")
+        .is_ok_and(|role| role.to_string() == "AXApplication")
+    {
+      let Ok(window_element) =
+        ax_element.get_attribute::<AXUIElement>("AXFocusedWindow")
+      else {
+        return;
+      };
+      window_element
+    } else {
+      ax_element
+    };
 
-    if is_new_window {
-      context.app_windows.lock().unwrap().push(window.clone());
-      let _ = Self::register_window_notifications(
-        &window,
-        &context.observer,
-        callback_context_ptr,
-      );
+    let Some(window) = with_window_notification_target(
+      ax_element.get_attribute::<CFString>("AXRole"),
+      || {
+        let found_window = {
+          let app_windows = context.app_windows.lock().unwrap();
 
-      if let Err(err) = context.events_tx.send(WindowEvent::Shown {
-        window: window.clone(),
-        notification: crate::WindowEventNotification(Some(
-          notification.clone(),
-        )),
-      }) {
-        tracing::warn!(
-          "Failed to send window event for PID {}: {}",
-          context.application.pid,
-          err
-        );
-      }
-    }
+          app_windows
+            .iter()
+            .find(|window| {
+              window.ax_ui_element().get_ref().ok() == Some(&ax_element)
+            })
+            .cloned()
+        };
+
+        let is_new_window = found_window.is_none();
+        let window = found_window.unwrap_or_else(|| {
+          let window_id = WindowId::from_window_element(&ax_element);
+          let ax_element = ThreadBound::new(
+            ax_element,
+            context.application.dispatcher.clone(),
+          );
+          NativeWindow::new(
+            window_id,
+            ax_element,
+            context.application.clone(),
+          )
+          .into()
+        });
+
+        if is_new_window {
+          context.app_windows.lock().unwrap().push(window.clone());
+          let _ = Self::register_window_notifications(
+            &window,
+            &context.observer,
+            callback_context_ptr,
+          );
+
+          if let Err(err) = context.events_tx.send(WindowEvent::Shown {
+            window: window.clone(),
+            notification: crate::WindowEventNotification(Some(
+              notification.clone(),
+            )),
+          }) {
+            tracing::warn!(
+              "Failed to send window event for PID {}: {}",
+              context.application.pid,
+              err
+            );
+          }
+        }
+
+        window
+      },
+    ) else {
+      return;
+    };
 
     let window_event = match notification.name.as_str() {
       "AXFocusedWindowChanged" => WindowEvent::Focused {
@@ -675,6 +729,34 @@ impl Drop for ApplicationObserver {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Finder's `AXTabButton` has role `AXRadioButton` and can share a CG ID
+  /// with its window; it must never reach notification admission effects.
+  #[test]
+  fn notification_admission_rejects_tab_buttons_and_accepts_windows() {
+    let mut admissions = Vec::new();
+
+    let rejected = with_window_notification_target(
+      Ok(CFString::from_static_str("AXRadioButton")),
+      || admissions.push("tab"),
+    );
+    assert_eq!(rejected, None);
+    assert!(admissions.is_empty());
+
+    let accepted = with_window_notification_target(
+      Ok(CFString::from_static_str("AXWindow")),
+      || admissions.push("window"),
+    );
+    assert_eq!(accepted, Some(()));
+    assert_eq!(admissions, vec!["window"]);
+
+    let unavailable = with_window_notification_target(
+      Err(crate::Error::Platform("Role lookup failed.".to_string())),
+      || admissions.push("unavailable"),
+    );
+    assert_eq!(unavailable, None);
+    assert_eq!(admissions, vec!["window"]);
+  }
 
   #[test]
   fn rediscovered_window_is_only_tracked_once() {

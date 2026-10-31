@@ -49,6 +49,39 @@ use crate::{
   wm_state::WmState,
 };
 
+/// Re-admits an unmanaged foreground window on native tab activity.
+///
+/// Managed and ignored windows bypass admission, avoiding focus changes
+/// and geometry feedback from repeated move notifications. Native lookups
+/// and admission are injectable so tests need no Accessibility
+/// permissions.
+#[cfg(target_os = "macos")]
+fn reconcile_active_window(
+  event: &WindowEvent,
+  state: &mut WmState,
+  is_active_valid: impl FnOnce(&wm_platform::NativeWindow, &WmState) -> bool,
+  show_window: impl FnOnce(
+    wm_platform::NativeWindow,
+    &mut WmState,
+  ) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+  let window = match event {
+    WindowEvent::Focused { window, .. }
+    | WindowEvent::MovedOrResized { window, .. }
+    | WindowEvent::TitleChanged { window, .. } => window,
+    _ => return Ok(()),
+  };
+
+  if state.window_from_native(window).is_none()
+    && !state.ignored_windows.contains(window)
+    && is_active_valid(window, state)
+  {
+    show_window(window.clone(), state)?;
+  }
+
+  Ok(())
+}
+
 pub struct WindowManager {
   pub event_rx: mpsc::UnboundedReceiver<WmEvent>,
   pub exit_rx: mpsc::UnboundedReceiver<()>,
@@ -84,6 +117,25 @@ impl WindowManager {
     config: &mut UserConfig,
   ) -> anyhow::Result<()> {
     let state = &mut self.state;
+
+    #[cfg(target_os = "macos")]
+    if let PlatformEvent::Window(window_event) = &event {
+      // Native tab activation can emit only move/title notifications.
+      // Observer tracking outlives invalid-window cleanup, so these need
+      // the same admission path as a newly shown window.
+      reconcile_active_window(
+        window_event,
+        state,
+        |window, state| {
+          state
+            .dispatcher
+            .focused_window()
+            .is_ok_and(|focused| focused == *window)
+            && window.is_valid()
+        },
+        |window, state| handle_window_shown(window, state, config),
+      )?;
+    }
 
     match event {
       PlatformEvent::DisplaySettingsChanged => {
@@ -822,5 +874,188 @@ impl WindowManager {
         tracing::warn!("{:?}", err);
       }
     }
+  }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+  use wm_platform::{NativeWindow, WindowEventNotification};
+
+  use super::*;
+  use crate::{
+    commands::{
+      container::attach_container,
+      window::{ignore_window, unmanage_window},
+    },
+    models::{TilingWindow, WindowContainer, Workspace},
+  };
+
+  /// Creates a managed window using the cleanup tests' root/workspace
+  /// tree.
+  ///
+  /// No monitor or native `Display` is needed for event reconciliation.
+  fn managed_window() -> (WmState, WindowContainer, Container) {
+    let (event_tx, _) = mpsc::unbounded_channel();
+    let (exit_tx, _) = mpsc::unbounded_channel();
+    let (restart_tx, _) = mpsc::unbounded_channel();
+    let state =
+      WmState::new(Dispatcher::mock(), event_tx, exit_tx, restart_tx);
+    let window = TilingWindow::mock().call();
+    let workspace = Workspace::mock()
+      .tiling_containers(vec![window.clone().into()])
+      .call();
+    assert!(attach_container(
+      &workspace.clone().into(),
+      &state.root_container.clone().into(),
+      None,
+    )
+    .is_ok());
+    (state, window.into(), workspace.into())
+  }
+
+  /// Creates the notification observed when switching Finder tabs.
+  fn moved(window: &NativeWindow) -> WindowEvent {
+    WindowEvent::MovedOrResized {
+      window: window.clone(),
+      is_interactive_start: false,
+      is_interactive_end: false,
+      notification: WindowEventNotification(None),
+    }
+  }
+
+  /// A tracked AX window can be absent from WM state after tab cleanup.
+  #[test]
+  fn active_tab_move_readmits_evicted_window_without_focus_notification() {
+    let (mut state, window, workspace) = managed_window();
+    let native = window.native().clone();
+    assert!(unmanage_window(window.clone(), &mut state).is_ok());
+    assert!(state.window_from_native(&native).is_none());
+
+    let mut admissions = 0;
+    let result = reconcile_active_window(
+      &moved(&native),
+      &mut state,
+      |_, _| true,
+      |candidate, state| {
+        assert_eq!(candidate, native);
+        admissions += 1;
+        // Stand in for native-property acquisition and window creation.
+        attach_container(&window.clone().into(), &workspace, None)?;
+        assert!(state.window_from_native(&candidate).is_some());
+        Ok(())
+      },
+    );
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(admissions, 1);
+    assert!(state.window_from_native(&native).is_some());
+
+    // Geometry notifications after admission must not show/redraw again.
+    assert!(reconcile_active_window(
+      &moved(&native),
+      &mut state,
+      |_, _| panic!("Managed events must not probe native focus."),
+      |_, _| panic!("Managed events must not run admission."),
+    )
+    .is_ok());
+    assert!(unmanage_window(window, &mut state).is_ok());
+  }
+
+  /// Inactive, background, or invalid tabs must not gain focus via
+  /// admission.
+  #[test]
+  fn inactive_tab_activity_does_not_readmit_window() {
+    let (mut state, window, _) = managed_window();
+    let native = window.native().clone();
+    assert!(unmanage_window(window, &mut state).is_ok());
+    assert!(reconcile_active_window(
+      &moved(&native),
+      &mut state,
+      |_, _| false,
+      |_, _| panic!("Inactive or invalid windows must not be admitted."),
+    )
+    .is_ok());
+    assert!(state.windows().is_empty());
+  }
+
+  /// Ignoring a tab survives inactivity, cleanup, and later activation.
+  #[test]
+  fn ignored_tab_survives_inactive_cleanup_and_is_not_readmitted() {
+    let (mut state, window, _) = managed_window();
+    let native = window.native().clone();
+    assert!(ignore_window(window, &mut state).is_ok());
+    assert!(state.windows().is_empty());
+
+    // Inactive tabs fail the managed probe but remain in CG OptionAll.
+    assert!(state
+      .cleanup_invalid_windows_with(|_| false, |_| true)
+      .is_ok());
+    assert_eq!(state.ignored_windows, vec![native.clone()]);
+
+    for event in [
+      moved(&native),
+      WindowEvent::Focused {
+        window: native.clone(),
+        notification: WindowEventNotification(None),
+      },
+    ] {
+      assert!(reconcile_active_window(
+        &event,
+        &mut state,
+        |_, _| panic!("Ignored windows must bypass native focus lookup."),
+        |_, _| panic!("Ignored windows must not be admitted."),
+      )
+      .is_ok());
+    }
+    assert!(state.windows().is_empty());
+  }
+
+  /// Destruction removes ignored entries even without a managed window.
+  #[test]
+  fn destroyed_ignored_tab_is_forgotten() {
+    let (mut state, window, _) = managed_window();
+    let native_id = window.native().id();
+    assert!(ignore_window(window, &mut state).is_ok());
+    assert_eq!(state.ignored_windows.len(), 1);
+    assert!(state.windows().is_empty());
+
+    assert!(handle_window_destroyed(native_id, &mut state).is_ok());
+    assert!(state.ignored_windows.is_empty());
+    assert!(state.windows().is_empty());
+  }
+
+  /// Periodic cleanup removes ignored ghosts when destruction is missed.
+  #[test]
+  fn ignored_tab_missing_from_all_windows_is_pruned() {
+    let (mut state, window, _) = managed_window();
+    assert!(ignore_window(window, &mut state).is_ok());
+    assert_eq!(state.ignored_windows.len(), 1);
+
+    assert!(state
+      .cleanup_invalid_windows_with(|_| false, |_| false)
+      .is_ok());
+    assert!(state.ignored_windows.is_empty());
+    assert!(state.windows().is_empty());
+  }
+
+  /// Genuine close still removes a managed tab and never admits it.
+  #[test]
+  fn destroyed_tab_is_unmanaged_without_reconciliation() {
+    let (mut state, window, _) = managed_window();
+    let native_id = window.native().id();
+    let event = WindowEvent::Destroyed {
+      window_id: native_id,
+      notification: WindowEventNotification(None),
+    };
+    assert!(reconcile_active_window(
+      &event,
+      &mut state,
+      |_, _| panic!("Destroyed events must not probe native focus."),
+      |_, _| panic!("Destroyed windows must not be admitted."),
+    )
+    .is_ok());
+    assert_eq!(state.windows().len(), 1);
+    let result = handle_window_destroyed(native_id, &mut state);
+    assert!(result.is_ok(), "{result:?}");
+    assert!(state.windows().is_empty());
   }
 }

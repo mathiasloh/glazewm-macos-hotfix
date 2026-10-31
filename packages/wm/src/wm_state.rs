@@ -675,19 +675,34 @@ impl WmState {
   ///
   /// See: <https://github.com/glzr-io/glazewm/issues/1219>
   pub fn cleanup_invalid_windows(&mut self) -> anyhow::Result<()> {
-    self.cleanup_invalid_windows_with(|window| window.native().is_valid())
+    self.cleanup_invalid_windows_with(
+      |window| window.native().is_valid(),
+      |window| {
+        #[cfg(target_os = "macos")]
+        {
+          use wm_platform::NativeWindowExtMacOs;
+          window.is_alive()
+        }
+        #[cfg(target_os = "windows")]
+        {
+          window.is_valid()
+        }
+      },
+    )
   }
 
-  /// Cleans up windows using a caller-provided validity predicate.
+  /// Cleans up managed and ignored windows using separate native probes.
   ///
-  /// The predicate is an internal test seam; production callers should use
+  /// The predicates are internal test seams; production callers should use
   /// [`Self::cleanup_invalid_windows`].
-  fn cleanup_invalid_windows_with<F>(
+  pub(crate) fn cleanup_invalid_windows_with<F, G>(
     &mut self,
     is_valid: F,
+    is_ignored_alive: G,
   ) -> anyhow::Result<()>
   where
     F: Fn(&WindowContainer) -> bool,
+    G: FnMut(&NativeWindow) -> bool,
   {
     let invalid_windows = self
       .windows()
@@ -699,8 +714,10 @@ impl WmState {
       unmanage_window(window, self)?;
     }
 
-    // Prune ignored windows that are no longer valid.
-    self.ignored_windows.retain(NativeWindow::is_valid);
+    // Ignored native tabs can be alive without being currently manageable.
+    // Prune only dead IDs, including ghosts with no destruction
+    // notification.
+    self.ignored_windows.retain(is_ignored_alive);
 
     Ok(())
   }
@@ -747,7 +764,7 @@ mod tests {
   fn cleanup_invalid_windows_removes_missing_window() {
     let (mut state, mut events) = state_with_one_tiling_window();
 
-    let result = state.cleanup_invalid_windows_with(|_| false);
+    let result = state.cleanup_invalid_windows_with(|_| false, |_| true);
     assert!(result.is_ok(), "{result:?}");
 
     assert!(state.windows().is_empty());
@@ -764,13 +781,15 @@ mod tests {
   fn cleanup_invalid_windows_retains_present_and_unknown_windows() {
     let (mut state, mut events) = state_with_one_tiling_window();
 
-    assert!(state.cleanup_invalid_windows_with(|_| true).is_ok());
+    assert!(state
+      .cleanup_invalid_windows_with(|_| true, |_| true)
+      .is_ok());
 
     assert_eq!(state.windows().len(), 1);
     assert!(events.try_recv().is_err());
 
     // Remove the mock before `WmState::drop` tries to redraw it.
-    let result = state.cleanup_invalid_windows_with(|_| false);
+    let result = state.cleanup_invalid_windows_with(|_| false, |_| true);
     assert!(result.is_ok(), "{result:?}");
   }
 
@@ -778,9 +797,11 @@ mod tests {
   fn cleanup_invalid_windows_is_idempotent() {
     let (mut state, mut events) = state_with_one_tiling_window();
 
-    let first_result = state.cleanup_invalid_windows_with(|_| false);
+    let first_result =
+      state.cleanup_invalid_windows_with(|_| false, |_| true);
     assert!(first_result.is_ok(), "{first_result:?}");
-    let second_result = state.cleanup_invalid_windows_with(|_| false);
+    let second_result =
+      state.cleanup_invalid_windows_with(|_| false, |_| true);
     assert!(second_result.is_ok(), "{second_result:?}");
 
     assert!(state.windows().is_empty());

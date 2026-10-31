@@ -106,10 +106,22 @@ pub trait NativeWindowExtMacOs {
   ///
   /// This method is only available on macOS.
   fn is_main(&self) -> crate::Result<bool>;
+
+  /// Whether WindowServer still owns this ID for its application,
+  /// including inactive native tabs.
+  ///
+  /// Unlike `is_valid`, this checks lifetime rather than eligibility for
+  /// management. Unavailable queries and session transitions retain the
+  /// window until a conclusive check or destruction notification.
+  fn is_alive(&self) -> bool;
 }
 
 #[cfg(target_os = "macos")]
 impl NativeWindowExtMacOs for NativeWindow {
+  fn is_alive(&self) -> bool {
+    self.inner.is_alive()
+  }
+
   fn ax_ui_element(&self) -> &ThreadBound<CFRetained<AXUIElement>> {
     &self.inner.element
   }

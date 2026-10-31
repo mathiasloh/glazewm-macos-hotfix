@@ -12,6 +12,12 @@ pub fn handle_window_destroyed(
   native_window_id: WindowId,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
+  // Ignored macOS tabs retain their IDs while inactive, but not on close.
+  #[cfg(target_os = "macos")]
+  state
+    .ignored_windows
+    .retain(|window| window.id() != native_window_id);
+
   let found_window = state
     .windows()
     .into_iter()
