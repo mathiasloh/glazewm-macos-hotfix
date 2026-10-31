@@ -38,6 +38,8 @@ mod commands;
 mod events;
 mod ipc_server;
 mod models;
+#[cfg(target_os = "macos")]
+mod native_tabs;
 mod pending_sync;
 mod sys_tray;
 mod traits;
@@ -186,7 +188,22 @@ async fn start_wm(
     .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
   loop {
+    // A WM-owned deadline has no observer callback that can be lost during
+    // teardown. Disabled when no slot is reserved; still runs when paused.
+    #[cfg(target_os = "macos")]
+    let tab_deadline = native_tabs::deadline(&wm.state);
+    #[cfg(target_os = "macos")]
+    let tab_timer = async {
+      match tab_deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending::<()>().await,
+      }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let tab_timer = std::future::pending::<()>();
+
     let res = tokio::select! {
+      () = tab_timer => wm.reconcile_native_tabs(&mut config),
       _ = signal::ctrl_c() => {
         tracing::info!("Received SIGINT signal.");
         break;
@@ -219,7 +236,7 @@ async fn start_wm(
         if wm.state.is_paused {
           Ok(())
         } else {
-          wm.state.cleanup_invalid_windows()
+          wm.cleanup_invalid_windows(&mut config)
         }
       },
       Some((

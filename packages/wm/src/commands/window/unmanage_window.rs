@@ -24,6 +24,11 @@ pub fn unmanage_window(
 
   detach_container(window.clone().into())?;
 
+  #[cfg(target_os = "macos")]
+  state
+    .pending_native_tabs
+    .retain(|pending| pending.id != window.id());
+
   // After detaching the container, flatten any redundant split containers.
   // For example, in the layout V[1 H[2]] where container 1 is detached to
   // become V[H[2]], this will then need to be flattened to V[2].

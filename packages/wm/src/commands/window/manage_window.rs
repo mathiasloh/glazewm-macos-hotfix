@@ -17,11 +17,45 @@ use crate::{
   wm_state::WmState,
 };
 
+/// Admits a native window using the normal new-window focus policy.
 pub fn manage_window(
   native_window: NativeWindow,
   target_parent: Option<Container>,
   state: &mut WmState,
   config: &mut UserConfig,
+) -> anyhow::Result<()> {
+  manage_window_with_focus(
+    native_window,
+    target_parent,
+    state,
+    config,
+    true,
+  )
+}
+
+/// Replays admission without treating an old notification as focus
+/// authority.
+#[cfg(target_os = "macos")]
+pub(crate) fn manage_window_preserving_focus(
+  native_window: NativeWindow,
+  state: &mut WmState,
+  config: &mut UserConfig,
+) -> anyhow::Result<()> {
+  let take_focus = state
+    .dispatcher
+    .focused_window()
+    .is_ok_and(|focused| focused == native_window);
+  manage_window_with_focus(native_window, None, state, config, take_focus)
+}
+
+/// Shares eligibility, creation, and Manage rules between live and
+/// deferred admission.
+fn manage_window_with_focus(
+  native_window: NativeWindow,
+  target_parent: Option<Container>,
+  state: &mut WmState,
+  config: &mut UserConfig,
+  take_focus: bool,
 ) -> anyhow::Result<()> {
   let Some(native_properties) =
     check_is_manageable(&native_window).unwrap_or(None)
@@ -29,19 +63,70 @@ pub fn manage_window(
     return Ok(());
   };
 
-  // Create the window instance. This may fail if the window handle has
-  // already been destroyed.
-  let window = try_warn!(create_window(
-    native_window,
-    native_properties,
-    target_parent,
-    state,
-    config
-  ));
+  #[cfg(target_os = "macos")]
+  let replacement = {
+    use wm_platform::NativeWindowExtMacOs;
 
-  // Set the newly added window as focus descendant. This means the window
-  // rules will be run as if the window is focused.
-  set_focused_descendant(&window.clone().into(), None);
+    native_window.refresh_tab_group();
+    let is_active_valid = native_window.is_valid()
+      && state
+        .dispatcher
+        .focused_window()
+        .is_ok_and(|focused| focused == native_window);
+    replace_native_tab(
+      &native_window,
+      &native_properties,
+      state,
+      config,
+      is_active_valid,
+      NativeWindow::is_valid,
+      |old| native_window.has_same_tab_group(old),
+    )
+  };
+  #[cfg(not(target_os = "macos"))]
+  let replacement: Option<WindowContainer> = None;
+
+  // Create only when no unique inactive tab can retain this layout slot.
+  let window = match replacement {
+    Some(window) => window,
+    None => try_warn!(create_window(
+      native_window,
+      native_properties,
+      target_parent,
+      state,
+      config
+    )),
+  };
+
+  if take_focus {
+    complete_window_management(window, state, config)
+  } else {
+    complete_window_management_with_focus(window, state, config, false)
+  }
+}
+
+/// Applies admission rules and publishes the final managed window.
+fn complete_window_management(
+  window: WindowContainer,
+  state: &mut WmState,
+  config: &mut UserConfig,
+) -> anyhow::Result<()> {
+  complete_window_management_with_focus(window, state, config, true)
+}
+
+/// Publishes admission, retaining newer focus when replaying inactive
+/// windows.
+fn complete_window_management_with_focus(
+  window: WindowContainer,
+  state: &mut WmState,
+  config: &mut UserConfig,
+  take_focus: bool,
+) -> anyhow::Result<()> {
+  // Live admission runs rules as focused; deferred inactive admission does
+  // not.
+  if take_focus {
+    set_focused_descendant(&window.clone().into(), None);
+  }
 
   // Window might be detached if `ignore` command has been invoked.
   let updated_window = run_window_rules(
@@ -60,16 +145,17 @@ pub fn manage_window(
 
     // OS focus should be set to the newly added window in case it's not
     // already focused.
-    state.pending_sync.queue_focus_change();
+    if take_focus {
+      state.pending_sync.queue_focus_change();
 
-    // Normally, a `PlatformEvent::WindowFocused` event is what triggers
-    // focus effects and workspace reordering to be applied. However, when
-    // a window is first launched, this event can come before the
-    // window is managed, and so we need to force an update here.
-    state.pending_sync.queue_focused_effect_update();
-    state.pending_sync.queue_workspace_to_reorder(
-      window.workspace().context("No workspace.")?,
-    );
+      // Initial focus notifications can precede admission, so update
+      // effects and workspace order here only when focus is still
+      // authorized.
+      state.pending_sync.queue_focused_effect_update();
+      state.pending_sync.queue_workspace_to_reorder(
+        window.workspace().context("No workspace.")?,
+      );
+    }
 
     // Sibling containers need to be redrawn if the window is tiling.
     state.pending_sync.queue_container_to_redraw(
@@ -84,11 +170,74 @@ pub fn manage_window(
   Ok(())
 }
 
+/// Reuses a unique inactive native tab's container, never its position.
+///
+/// Platform predicates are injected so layout tests need no live windows.
+#[cfg(target_os = "macos")]
+fn replace_native_tab(
+  native: &NativeWindow,
+  properties: &NativeWindowProperties,
+  state: &WmState,
+  config: &UserConfig,
+  is_active_valid: bool,
+  is_valid: impl Fn(&NativeWindow) -> bool,
+  same_group: impl Fn(&NativeWindow) -> bool,
+) -> Option<WindowContainer> {
+  if !is_active_valid
+    || state.ignored_windows.contains(native)
+    || state.window_from_native(native).is_some()
+  {
+    return None;
+  }
+
+  let windows = state.windows();
+  let mut matches = windows.into_iter().filter(|window| {
+    !is_valid(&window.native()) && same_group(&window.native())
+  });
+  let window = matches.next()?;
+  if matches.next().is_some() {
+    return None;
+  }
+
+  if !native_tab_allowed(native, properties, config) {
+    return None;
+  }
+
+  window.replace_native(native.clone(), properties.clone());
+  Some(window)
+}
+
+/// Previews Ignore rules without attaching or changing the retained slot.
+#[cfg(target_os = "macos")]
+pub(crate) fn native_tab_allowed(
+  native: &NativeWindow,
+  properties: &NativeWindowProperties,
+  config: &UserConfig,
+) -> bool {
+  let preview: WindowContainer = TilingWindow::new(
+    None,
+    native.clone(),
+    properties.clone(),
+    None,
+    RectDelta::zero(),
+    properties.frame.clone(),
+    false,
+    Default::default(),
+    Vec::new(),
+    None,
+  )
+  .into();
+  !config
+    .pending_window_rules(&preview, &WindowRuleEvent::Manage)
+    .iter()
+    .any(|rule| rule.commands.contains(&wm_common::InvokeCommand::Ignore))
+}
+
 /// Checks if a window is manageable and retrieves its native properties.
 ///
 /// Returns `Ok(Some(properties))` if the window is manageable and its
 /// properties were retrieved successfully.
-fn check_is_manageable(
+pub(crate) fn check_is_manageable(
   native_window: &NativeWindow,
 ) -> anyhow::Result<Option<NativeWindowProperties>> {
   if !native_window.is_visible()? {
@@ -383,6 +532,10 @@ fn insertion_target(
     focused_workspace.child_count(),
   ))
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "manage_window_tab_tests.rs"]
+mod native_tab_tests;
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {

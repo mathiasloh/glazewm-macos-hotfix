@@ -36,6 +36,16 @@ pub struct WmState {
 
   pub pending_sync: PendingSync,
 
+  /// Destroyed group-backed slots awaiting their one-shot deadline.
+  #[cfg(target_os = "macos")]
+  pub(crate) pending_native_tabs:
+    Vec<crate::native_tabs::PendingNativeTab>,
+
+  /// Deduplicated same-owner activity, replayed once reservations
+  /// resolve.
+  #[cfg(target_os = "macos")]
+  pub(crate) deferred_native_tab_windows: Vec<NativeWindow>,
+
   /// Name of the most recently focused workspace.
   ///
   /// Used for the `general.toggle_workspace_on_refocus` option on
@@ -91,6 +101,10 @@ impl WmState {
       root_container: RootContainer::new(),
       dispatcher,
       pending_sync: PendingSync::default(),
+      #[cfg(target_os = "macos")]
+      pending_native_tabs: Vec::new(),
+      #[cfg(target_os = "macos")]
+      deferred_native_tab_windows: Vec::new(),
       prev_effects_window: None,
       recent_workspace_name: None,
       unmanaged_or_minimized_timestamp: None,
@@ -103,6 +117,12 @@ impl WmState {
       exit_tx,
       restart_keybinding_tx,
     }
+  }
+
+  /// Enables event delivery for an already populated in-memory fixture.
+  #[cfg(test)]
+  pub(crate) fn initialize_for_testing(&mut self) {
+    self.has_initialized = true;
   }
 
   /// Populates the initial WM state by creating containers for all
@@ -667,6 +687,23 @@ impl WmState {
       .cloned()
   }
 
+  /// Whether native sync must skip a dead binding retained for tab
+  /// recovery.
+  pub(crate) fn native_binding_reserved(
+    &self,
+    window: &WindowContainer,
+  ) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+      crate::native_tabs::is_reserved(window, self)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+      let _ = window;
+      false
+    }
+  }
+
   /// Cleans up windows that are no longer alive.
   ///
   /// This addresses the "ghost window" issue where applications may
@@ -710,6 +747,10 @@ impl WmState {
       .filter(|window| !is_valid(window));
 
     for window in invalid_windows {
+      #[cfg(target_os = "macos")]
+      if crate::native_tabs::reserve(&window, self) {
+        continue;
+      }
       tracing::info!("Removing invalid window: {}", window);
       unmanage_window(window, self)?;
     }
@@ -818,6 +859,9 @@ impl Drop for WmState {
     let managed_windows = self.windows();
 
     for window in &managed_windows {
+      if self.native_binding_reserved(window) {
+        continue;
+      }
       // Redraw windows to their intended positions. On macOS, this will
       // unhide windows that are on other workspaces.
       if let Ok(rect) = window.to_rect() {

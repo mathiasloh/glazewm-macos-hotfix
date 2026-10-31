@@ -17,6 +17,12 @@ pub fn handle_window_shown(
   if let Some(window) = found_window {
     info!("Window shown: {window}");
 
+    #[cfg(target_os = "macos")]
+    {
+      use wm_platform::NativeWindowExtMacOs;
+      window.native().refresh_tab_group();
+    }
+
     // Update display state if window is already managed.
     if config.value.general.hide_method != HideMethod::PlaceInCorner
       && window.display_state() == DisplayState::Showing

@@ -25,7 +25,12 @@ pub fn platform_sync(
   let focused_container =
     state.focused_container().context("No focused container.")?;
 
-  if state.pending_sync.needs_focus_update() {
+  let focused_reserved = focused_container
+    .as_window_container()
+    .ok()
+    .is_some_and(|window| state.native_binding_reserved(&window));
+
+  if state.pending_sync.needs_focus_update() && !focused_reserved {
     sync_focus(&focused_container, state)?;
   }
 
@@ -35,7 +40,8 @@ pub fn platform_sync(
     redraw_containers(&focused_container, state, config)?;
   }
 
-  if state.pending_sync.needs_cursor_jump()
+  if !focused_reserved
+    && state.pending_sync.needs_cursor_jump()
     && config.value.general.cursor_jump.enabled
   {
     jump_cursor(focused_container.clone(), state, config)?;
@@ -49,8 +55,10 @@ pub fn platform_sync(
     let prev_effects_window = state.prev_effects_window.clone();
 
     if let Ok(window) = focused_container.as_window_container() {
-      apply_window_effects(&window, true, config);
-      state.prev_effects_window = Some(window.clone());
+      if !state.native_binding_reserved(&window) {
+        apply_window_effects(&window, true, config);
+        state.prev_effects_window = Some(window.clone());
+      }
     } else {
       state.prev_effects_window = None;
     }
@@ -66,7 +74,8 @@ pub fn platform_sync(
         prev_effects_window.into_iter().collect()
       }
       .into_iter()
-      .filter(|window| window.id() != focused_container.id());
+      .filter(|window| window.id() != focused_container.id())
+      .filter(|window| !state.native_binding_reserved(window));
 
     for window in unfocused_windows {
       apply_window_effects(&window, false, config);
@@ -148,20 +157,26 @@ fn windows_to_bring_to_front(
         .and_then(|container| container.as_window_container().ok());
 
       match focused_descendant {
-        Some(focused_descendant) => workspace
-          .descendants()
-          .filter_map(|descendant| descendant.as_window_container().ok())
-          .filter(|window| {
-            let is_floating_or_tiling = matches!(
-              window.state(),
-              WindowState::Floating(_) | WindowState::Tiling
-            );
+        Some(focused_descendant)
+          if !state.native_binding_reserved(&focused_descendant) =>
+        {
+          workspace
+            .descendants()
+            .filter_map(|descendant| descendant.as_window_container().ok())
+            .filter(|window| {
+              let is_floating_or_tiling = matches!(
+                window.state(),
+                WindowState::Floating(_) | WindowState::Tiling
+              );
 
-            is_floating_or_tiling
-              && window.state().is_same_state(&focused_descendant.state())
-          })
-          .collect(),
-        None => vec![],
+              is_floating_or_tiling
+                && window
+                  .state()
+                  .is_same_state(&focused_descendant.state())
+            })
+            .collect()
+        }
+        _ => vec![],
       }
     })
     .collect::<Vec<_>>();
@@ -208,6 +223,9 @@ fn redraw_containers(
   let monitors_by_hide_corner = state.monitors_by_hide_corner();
 
   for window in windows_to_update.iter().rev() {
+    if state.native_binding_reserved(window) {
+      continue;
+    }
     let should_bring_to_front = windows_to_bring_to_front.contains(window);
 
     let workspace =

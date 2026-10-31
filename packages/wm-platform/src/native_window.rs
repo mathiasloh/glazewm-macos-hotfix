@@ -114,10 +114,55 @@ pub trait NativeWindowExtMacOs {
   /// management. Unavailable queries and session transitions retain the
   /// window until a conclusive check or destruction notification.
   fn is_alive(&self) -> bool;
+
+  /// Refreshes the retained direct `AXTabGroup` of an eligible window.
+  fn refresh_tab_group(&self);
+
+  /// Whether both windows have the same retained native tab group.
+  fn has_same_tab_group(&self, other: &NativeWindow) -> bool;
+
+  /// Whether both windows belong to the same owning process.
+  fn has_same_owner(&self, other: &NativeWindow) -> bool;
+
+  /// Queries fresh owner focus and `AXWindows`, including tracked tabs.
+  fn tab_group_candidates(&self) -> crate::Result<Vec<NativeWindow>>;
 }
 
 #[cfg(target_os = "macos")]
 impl NativeWindowExtMacOs for NativeWindow {
+  fn has_same_owner(&self, other: &NativeWindow) -> bool {
+    #[cfg(feature = "test_utils")]
+    if let Some(mock) = &self.inner.mock_tab {
+      let owner = mock.lock().expect("Mock lock.").owner;
+      return other.inner.mock_tab.as_ref().is_some_and(|other| {
+        other.lock().expect("Mock lock.").owner == owner
+      });
+    }
+    self.inner.application.pid == other.inner.application.pid
+  }
+  fn tab_group_candidates(&self) -> crate::Result<Vec<NativeWindow>> {
+    #[cfg(feature = "test_utils")]
+    if let Some(mock) = &self.inner.mock_tab {
+      let mock = mock.lock().expect("Mock lock.");
+      if mock.enumeration_failed {
+        return Err(crate::Error::WindowEnumerationFailed);
+      }
+      return Ok(mock.owner_windows.clone());
+    }
+    let mut windows = self.inner.application.windows()?;
+    if let Ok(Some(focused)) = self.inner.application.focused_window() {
+      windows.push(focused);
+    }
+    Ok(windows)
+  }
+  fn refresh_tab_group(&self) {
+    self.inner.refresh_tab_group();
+  }
+
+  fn has_same_tab_group(&self, other: &NativeWindow) -> bool {
+    self.inner.has_same_tab_group(&other.inner)
+  }
+
   fn is_alive(&self) -> bool {
     self.inner.is_alive()
   }
@@ -131,10 +176,18 @@ impl NativeWindowExtMacOs for NativeWindow {
   }
 
   fn is_crossover_wine_helper(&self) -> bool {
+    #[cfg(feature = "test_utils")]
+    if self.inner.mock_tab.is_some() {
+      return false;
+    }
     self.inner.application.is_crossover_wine_helper()
   }
 
   fn role(&self) -> crate::Result<String> {
+    #[cfg(feature = "test_utils")]
+    if self.inner.mock_tab.is_some() {
+      return Ok("AXWindow".into());
+    }
     self.inner.element.with(|el| {
       el.get_attribute::<CFString>("AXRole")
         .map(|cf_string| cf_string.to_string())
@@ -142,6 +195,10 @@ impl NativeWindowExtMacOs for NativeWindow {
   }
 
   fn subrole(&self) -> crate::Result<String> {
+    #[cfg(feature = "test_utils")]
+    if self.inner.mock_tab.is_some() {
+      return Ok("AXStandardWindow".into());
+    }
     self.inner.element.with(|el| {
       el.get_attribute::<CFString>("AXSubrole")
         .map(|cf_string| cf_string.to_string())

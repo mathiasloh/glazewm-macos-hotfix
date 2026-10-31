@@ -60,6 +60,13 @@ pub trait WindowGetters: CommonGetters {
 
   fn native(&self) -> Ref<'_, NativeWindow>;
 
+  /// Replaces native identity and properties without changing layout.
+  fn replace_native(
+    &self,
+    native: NativeWindow,
+    properties: NativeWindowProperties,
+  );
+
   fn border_delta(&self) -> RectDelta;
 
   fn set_border_delta(&self, border_delta: RectDelta);
@@ -195,6 +202,18 @@ macro_rules! impl_window_getters {
 
       fn native(&self) -> Ref<'_, NativeWindow> {
         Ref::map(self.0.borrow(), |inner| &inner.native)
+      }
+
+      fn replace_native(
+        &self,
+        native: NativeWindow,
+        properties: NativeWindowProperties,
+      ) {
+        let mut inner = self.0.borrow_mut();
+        inner.native = native;
+        inner.native_properties = properties;
+        inner.done_window_rules.clear();
+        inner.active_drag = None;
       }
 
       fn border_delta(&self) -> RectDelta {

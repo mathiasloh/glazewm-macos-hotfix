@@ -14,6 +14,8 @@ use wm_platform::{
   Dispatcher, LengthValue, PlatformEvent, RectDelta, WindowEvent,
 };
 
+#[cfg(any(not(target_os = "macos"), test))]
+use crate::events::handle_window_destroyed;
 use crate::{
   commands::{
     container::{
@@ -37,7 +39,7 @@ use crate::{
   },
   events::{
     handle_display_settings_changed, handle_mouse_move,
-    handle_window_destroyed, handle_window_focused, handle_window_hidden,
+    handle_window_focused, handle_window_hidden,
     handle_window_minimize_ended, handle_window_minimized,
     handle_window_moved_or_resized, handle_window_shown,
     handle_window_title_changed,
@@ -120,6 +122,41 @@ impl WindowManager {
 
     #[cfg(target_os = "macos")]
     if let PlatformEvent::Window(window_event) = &event {
+      // Late Hidden/minimize/property notifications cannot detach or
+      // mutate a reserved dead binding before its replace-or-close
+      // deadline.
+      if window_event
+        .window()
+        .and_then(|native| state.window_from_native(native))
+        .is_some_and(|managed| state.native_binding_reserved(&managed))
+      {
+        return Ok(());
+      }
+      // Hold unowned same-owner activity until the reserved slot resolves,
+      // rather than creating a duplicate or running focus-stealing
+      // admission.
+      if let WindowEvent::Shown { window, .. }
+      | WindowEvent::Focused { window, .. }
+      | WindowEvent::MovedOrResized { window, .. }
+      | WindowEvent::TitleChanged { window, .. } = window_event
+      {
+        if crate::native_tabs::blocks_admission(window, state) {
+          return Ok(());
+        }
+      }
+
+      // Refresh the managed instance, not the transient event's clone.
+      // Inactive tabs may no longer expose their native group.
+      if let WindowEvent::Focused { window, .. }
+      | WindowEvent::MovedOrResized { window, .. }
+      | WindowEvent::TitleChanged { window, .. } = window_event
+      {
+        use wm_platform::NativeWindowExtMacOs;
+        if let Some(managed) = state.window_from_native(window) {
+          managed.native().refresh_tab_group();
+        }
+      }
+
       // Native tab activation can emit only move/title notifications.
       // Observer tracking outlives invalid-window cleanup, so these need
       // the same admission path as a newly shown window.
@@ -195,7 +232,14 @@ impl WindowManager {
           handle_window_title_changed(&window, state, config)
         }
         WindowEvent::Destroyed { window_id, .. } => {
-          handle_window_destroyed(window_id, state)
+          #[cfg(target_os = "macos")]
+          {
+            crate::native_tabs::destroyed(window_id, state, config)
+          }
+          #[cfg(not(target_os = "macos"))]
+          {
+            handle_window_destroyed(window_id, state)
+          }
         }
       },
     }?;
@@ -204,6 +248,50 @@ impl WindowManager {
       platform_sync(state, config)?;
     }
 
+    Ok(())
+  }
+
+  /// Resolves one-shot tab deadlines without suspending bookkeeping on
+  /// pause.
+  pub(crate) fn reconcile_native_tabs(
+    &mut self,
+    config: &mut UserConfig,
+  ) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    crate::native_tabs::reconcile_due(
+      &mut self.state,
+      config,
+      std::time::Instant::now(),
+    )?;
+    #[cfg(target_os = "macos")]
+    crate::native_tabs::replay_ready(&mut self.state, config);
+    if !self.state.is_paused && self.state.pending_sync.has_changes() {
+      platform_sync(&mut self.state, config)?;
+    }
+    Ok(())
+  }
+
+  /// Probes cleanup-discovered tab slots before flushing native changes.
+  pub(crate) fn cleanup_invalid_windows(
+    &mut self,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] config: &mut UserConfig,
+  ) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    let previous = self
+      .state
+      .pending_native_tabs
+      .iter()
+      .map(|pending| pending.id)
+      .collect::<Vec<_>>();
+    self.state.cleanup_invalid_windows()?;
+    #[cfg(target_os = "macos")]
+    crate::native_tabs::probe_new(&mut self.state, config, &previous)?;
+    #[cfg(target_os = "macos")]
+    crate::native_tabs::replay_ready(&mut self.state, config);
+    #[cfg(target_os = "macos")]
+    if !self.state.is_paused && self.state.pending_sync.has_changes() {
+      platform_sync(&mut self.state, config)?;
+    }
     Ok(())
   }
 

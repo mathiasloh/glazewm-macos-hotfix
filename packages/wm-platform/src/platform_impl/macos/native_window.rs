@@ -1,4 +1,4 @@
-use std::{ffi::c_void, sync::Arc};
+use std::{cell::RefCell, ffi::c_void, sync::Arc};
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
@@ -6,7 +6,8 @@ use objc2_app_kit::{
 };
 use objc2_application_services::{AXError, AXValue};
 use objc2_core_foundation::{
-  CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CGPoint, CGSize,
+  CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString,
+  CGPoint, CGSize,
 };
 use objc2_core_graphics::{
   kCGWindowNumber, kCGWindowOwnerPID, CGDisplayIsAsleep, CGError,
@@ -205,6 +206,10 @@ pub(crate) struct NativeWindow {
   pub(crate) id: WindowId,
   pub(crate) element: Arc<ThreadBound<CFRetained<AXUIElement>>>,
   pub(crate) application: Application,
+  #[cfg(feature = "test_utils")]
+  pub(crate) mock_tab:
+    Option<Arc<std::sync::Mutex<crate::test_utils::MockTab>>>,
+  tab_group: Arc<ThreadBound<RefCell<Option<CFRetained<AXUIElement>>>>>,
 }
 
 impl NativeWindow {
@@ -215,11 +220,91 @@ impl NativeWindow {
     element: ThreadBound<CFRetained<AXUIElement>>,
     application: Application,
   ) -> Self {
+    let tab_group = Arc::new(ThreadBound::new(
+      RefCell::new(None),
+      application.dispatcher.clone(),
+    ));
     Self {
+      #[cfg(feature = "test_utils")]
+      mock_tab: None,
+      tab_group,
       element: Arc::new(element),
       id,
       application,
     }
+  }
+
+  /// Refreshes group identity only while this window is eligible.
+  ///
+  /// Inactive tabs do not expose their group. Retain their last active
+  /// identity, but clear failed or missing lookups on eligible windows so
+  /// detaching or moving a tab cannot keep an observed stale identity.
+  pub(crate) fn refresh_tab_group(&self) {
+    #[cfg(feature = "test_utils")]
+    if self.mock_tab.is_some() {
+      return;
+    }
+    if !self.is_valid() {
+      return;
+    }
+
+    let _ = self.element.with(|el| {
+      let group =
+        (|| -> crate::Result<Option<CFRetained<AXUIElement>>> {
+          if el.get_attribute::<CFString>("AXRole")?.to_string()
+            != "AXWindow"
+          {
+            return Ok(None);
+          }
+          let children =
+            el.get_attribute::<CFArray<AXUIElement>>("AXChildren")?;
+          let mut group = None;
+          for child in children.iter() {
+            if child.get_attribute::<CFString>("AXRole")?.to_string()
+              == "AXTabGroup"
+            {
+              if group.is_some() {
+                return Ok(None);
+              }
+              group = Some(child);
+            }
+          }
+          Ok(group)
+        })()
+        .ok()
+        .flatten();
+      if let Ok(cached) = self.tab_group.get_ref() {
+        *cached.borrow_mut() = group;
+      }
+    });
+  }
+
+  /// Compares retained native group identities on their owning thread.
+  pub(crate) fn has_same_tab_group(&self, other: &Self) -> bool {
+    #[cfg(feature = "test_utils")]
+    if let Some(mock) = &self.mock_tab {
+      let (owner, group) = {
+        let mock = mock.lock().expect("Mock lock.");
+        (mock.owner, mock.group)
+      };
+      return other.mock_tab.as_ref().is_some_and(|other| {
+        let other = other.lock().expect("Mock lock.");
+        group.is_some() && owner == other.owner && group == other.group
+      });
+    }
+    self.application.pid == other.application.pid
+      && self
+        .tab_group
+        .with(|group| {
+          let Ok(other_group) = other.tab_group.get_ref() else {
+            return false;
+          };
+          match (&*group.borrow(), &*other_group.borrow()) {
+            (Some(group), Some(other_group)) => group == other_group,
+            _ => false,
+          }
+        })
+        .unwrap_or(false)
   }
 
   /// Implements [`NativeWindow::id`].
@@ -229,6 +314,10 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::title`].
   pub(crate) fn title(&self) -> crate::Result<String> {
+    #[cfg(feature = "test_utils")]
+    if let Some(_mock) = &self.mock_tab {
+      return Ok(format!("Tab {}", self.id.0));
+    }
     self.element.with(|el| {
       el.get_attribute::<CFString>("AXTitle")
         .map(|cf_string| cf_string.to_string())
@@ -237,6 +326,10 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::process_name`].
   pub(crate) fn process_name(&self) -> crate::Result<String> {
+    #[cfg(feature = "test_utils")]
+    if let Some(_mock) = &self.mock_tab {
+      return Ok("Finder".into());
+    }
     self
       .application
       .process_name()
@@ -247,6 +340,10 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::frame`].
   pub(crate) fn frame(&self) -> crate::Result<Rect> {
+    #[cfg(feature = "test_utils")]
+    if let Some(_mock) = &self.mock_tab {
+      return Ok(Rect::from_xy(0, 0, 300, 200));
+    }
     // TODO: Consider refactoring this to use a single dispatch.
     // TODO: Would `AXFrame` work instead?
     let size = self.size()?;
@@ -280,11 +377,20 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::is_valid`].
   pub(crate) fn is_valid(&self) -> bool {
+    #[cfg(feature = "test_utils")]
+    if let Some(_mock) = &self.mock_tab {
+      let mock = _mock;
+      return mock.lock().expect("Mock lock.").valid;
+    }
     self.has_window_server_presence(false)
   }
 
   /// Implements [`crate::NativeWindowExtMacOs::is_alive`].
   pub(crate) fn is_alive(&self) -> bool {
+    #[cfg(feature = "test_utils")]
+    if let Some(_mock) = &self.mock_tab {
+      return true;
+    }
     self.has_window_server_presence(true)
   }
 
@@ -309,11 +415,19 @@ impl NativeWindow {
   /// Implements [`NativeWindow::is_visible`].
   #[allow(clippy::unnecessary_wraps)]
   pub(crate) fn is_visible(&self) -> crate::Result<bool> {
+    #[cfg(feature = "test_utils")]
+    if let Some(_mock) = &self.mock_tab {
+      return Ok(true);
+    }
     Ok(!self.application.is_hidden())
   }
 
   /// Implements [`NativeWindow::is_minimized`].
   pub(crate) fn is_minimized(&self) -> crate::Result<bool> {
+    #[cfg(feature = "test_utils")]
+    if let Some(_mock) = &self.mock_tab {
+      return Ok(false);
+    }
     self.element.with(|el| {
       el.get_attribute::<CFBoolean>("AXMinimized")
         .map(|cf_bool| cf_bool.value())
@@ -322,6 +436,10 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::is_maximized`].
   pub(crate) fn is_maximized(&self) -> crate::Result<bool> {
+    #[cfg(feature = "test_utils")]
+    if let Some(_mock) = &self.mock_tab {
+      return Ok(false);
+    }
     self.element.with(|el| {
       el.get_attribute::<CFBoolean>("AXFullScreen")
         .map(|cf_bool| cf_bool.value())
@@ -331,6 +449,10 @@ impl NativeWindow {
   /// Implements [`NativeWindow::is_resizable`].
   #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
   pub(crate) fn is_resizable(&self) -> crate::Result<bool> {
+    #[cfg(feature = "test_utils")]
+    if let Some(_mock) = &self.mock_tab {
+      return Ok(true);
+    }
     // TODO: Not sure if this is even available via the AX API.
     Ok(true)
   }
@@ -345,6 +467,15 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::set_frame`].
   pub(crate) fn set_frame(&self, rect: &Rect) -> crate::Result<()> {
+    #[cfg(feature = "test_utils")]
+    if let Some(mock) = &self.mock_tab {
+      mock
+        .lock()
+        .expect("Mock lock.")
+        .operations
+        .push("set_frame".into());
+      return Ok(());
+    }
     // TODO: Consider adding a separate `set_frame_async` method which
     // spawns a thread. Calling blocking AXUIElement methods from different
     // threads supposedly works fine.
@@ -403,6 +534,15 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::focus`].
   pub(crate) fn focus(&self) -> crate::Result<()> {
+    #[cfg(feature = "test_utils")]
+    if let Some(mock) = &self.mock_tab {
+      mock
+        .lock()
+        .expect("Mock lock.")
+        .operations
+        .push("focus".into());
+      return Ok(());
+    }
     let psn = self.application.psn()?;
     self.set_front_process(&psn)?;
     self.set_key_window(&psn)?;

@@ -32,6 +32,20 @@ pub struct UserConfig {
 }
 
 impl UserConfig {
+  /// Creates an in-memory config for tests without operator file access.
+  #[cfg(test)]
+  pub(crate) fn for_testing(window_rules: Vec<WindowRuleConfig>) -> Self {
+    let mut value: ParsedConfig =
+      serde_yaml::from_str(SAMPLE_CONFIG).expect("Valid sample config.");
+    value.window_rules = window_rules;
+    Self {
+      path: PathBuf::new(),
+      window_rules_by_event: Self::window_rules_by_event(&value),
+      value,
+      value_str: String::new(),
+    }
+  }
+
   /// Creates an instance of `UserConfig`. Reads and validates the user
   /// config from the given path.
   ///

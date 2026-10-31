@@ -13,17 +13,153 @@ use crate::ThreadBound;
 pub use crate::WindowId;
 pub use crate::{Dispatcher, Display, NativeWindow};
 
+/// Records dispatcher operations without touching the operator desktop.
+#[derive(Debug, Default)]
+pub(crate) struct MockDispatcher {
+  pub(crate) focus: Option<NativeWindow>,
+  pub(crate) operations: Vec<String>,
+}
+
 impl Dispatcher {
+  /// Returns native dispatcher operations requested by production sync.
+  pub fn mock_operations(&self) -> Vec<String> {
+    self
+      .mock_focus
+      .as_ref()
+      .expect("Mock dispatcher.")
+      .lock()
+      .expect("Mock lock.")
+      .operations
+      .clone()
+  }
+  /// Sets global focus without any Accessibility or desktop access.
+  pub fn mock_set_focused_window(&self, window: Option<NativeWindow>) {
+    self
+      .mock_focus
+      .as_ref()
+      .expect("Mock dispatcher.")
+      .lock()
+      .expect("Mock lock.")
+      .focus = window;
+  }
   /// Creates a mock `Dispatcher` for use in tests.
   ///
   /// Calling any methods on the mock is undefined behavior and may panic.
   #[must_use]
   pub fn mock() -> Self {
-    Self::new(None, Arc::new(AtomicBool::new(false)))
+    let mut dispatcher = Self::new(None, Arc::new(AtomicBool::new(false)));
+    dispatcher.mock_focus =
+      Some(Arc::new(std::sync::Mutex::new(MockDispatcher::default())));
+    dispatcher
   }
 }
 
+/// Test-only native boundary data, shared by clones of one window.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub(crate) struct MockTab {
+  pub(crate) owner: i32,
+  pub(crate) group: Option<u32>,
+  pub(crate) valid: bool,
+  pub(crate) owner_windows: Vec<NativeWindow>,
+  pub(crate) enumeration_failed: bool,
+  pub(crate) operations: Vec<String>,
+}
+
 impl NativeWindow {
+  /// Creates an isolated native boundary fixture with retained group
+  /// identity.
+  #[cfg(target_os = "macos")]
+  pub fn mock_tab(id: WindowId, owner: i32, group: Option<u32>) -> Self {
+    let mut window = Self::mock_with_id(id);
+    window.inner.mock_tab =
+      Some(Arc::new(std::sync::Mutex::new(MockTab {
+        owner,
+        group,
+        valid: true,
+        owner_windows: Vec::new(),
+        enumeration_failed: false,
+        operations: Vec::new(),
+      })));
+    window
+  }
+
+  /// Changes eligibility without changing lifetime or cached group
+  /// identity.
+  #[cfg(target_os = "macos")]
+  pub fn mock_set_valid(&self, valid: bool) {
+    self
+      .inner
+      .mock_tab
+      .as_ref()
+      .expect("Mock tab.")
+      .lock()
+      .expect("Mock lock.")
+      .valid = valid;
+  }
+
+  /// Changes the freshly queryable group independently of owner inventory.
+  #[cfg(target_os = "macos")]
+  pub fn mock_set_tab_group(&self, group: Option<u32>) {
+    self
+      .inner
+      .mock_tab
+      .as_ref()
+      .expect("Mock tab.")
+      .lock()
+      .expect("Mock lock.")
+      .group = group;
+  }
+
+  /// Sets a fresh owner inventory independently of global focus.
+  #[cfg(target_os = "macos")]
+  pub fn mock_set_owner_windows(&self, windows: Vec<Self>) {
+    self
+      .inner
+      .mock_tab
+      .as_ref()
+      .expect("Mock tab.")
+      .lock()
+      .expect("Mock lock.")
+      .owner_windows = windows;
+  }
+
+  /// Makes the owner enumeration fail without fabricating a final close
+  /// signal.
+  #[cfg(target_os = "macos")]
+  pub fn mock_fail_owner_enumeration(&self) {
+    self
+      .inner
+      .mock_tab
+      .as_ref()
+      .expect("Mock tab.")
+      .lock()
+      .expect("Mock lock.")
+      .enumeration_failed = true;
+  }
+
+  /// Returns operations performed through the real native sync boundary.
+  #[cfg(target_os = "macos")]
+  pub fn mock_operations(&self) -> Vec<String> {
+    self
+      .inner
+      .mock_tab
+      .as_ref()
+      .expect("Mock tab.")
+      .lock()
+      .expect("Mock lock.")
+      .operations
+      .clone()
+  }
+  /// Creates a mock with a distinct native ID, without querying a window.
+  #[cfg(target_os = "macos")]
+  #[must_use]
+  pub fn mock_with_id(id: WindowId) -> Self {
+    let mut window = Self::mock();
+    window.inner.id = id;
+    window
+  }
+
   /// Creates a mock `NativeWindow` for use in tests.
   ///
   /// Calling any methods on the mock is undefined behavior and may panic.
@@ -48,8 +184,20 @@ impl NativeWindow {
         dispatcher,
       );
 
-      platform_impl::NativeWindow::new(WindowId(0), element, application)
-        .into()
+      let mut window = platform_impl::NativeWindow::new(
+        WindowId(0),
+        element,
+        application,
+      );
+      window.mock_tab = Some(Arc::new(std::sync::Mutex::new(MockTab {
+        owner: 0,
+        group: None,
+        valid: true,
+        owner_windows: Vec::new(),
+        enumeration_failed: false,
+        operations: Vec::new(),
+      })));
+      window.into()
     }
   }
 }

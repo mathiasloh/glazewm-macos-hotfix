@@ -338,6 +338,9 @@ impl DispatcherExtWindows for Dispatcher {
 pub struct Dispatcher {
   source: Option<platform_impl::EventLoopSource>,
   stopped: Arc<AtomicBool>,
+  #[cfg(feature = "test_utils")]
+  pub(crate) mock_focus:
+    Option<Arc<std::sync::Mutex<crate::test_utils::MockDispatcher>>>,
 }
 
 impl Dispatcher {
@@ -347,7 +350,12 @@ impl Dispatcher {
     source: Option<platform_impl::EventLoopSource>,
     stopped: Arc<AtomicBool>,
   ) -> Self {
-    Self { source, stopped }
+    Self {
+      source,
+      stopped,
+      #[cfg(feature = "test_utils")]
+      mock_focus: None,
+    }
   }
 
   /// Stops the event loop gracefully from any thread.
@@ -550,6 +558,15 @@ impl Dispatcher {
   ///
   /// This may be the desktop window if no window has focus.
   pub fn focused_window(&self) -> crate::Result<NativeWindow> {
+    #[cfg(feature = "test_utils")]
+    if let Some(focus) = &self.mock_focus {
+      return focus
+        .lock()
+        .expect("Mock lock.")
+        .focus
+        .clone()
+        .ok_or(crate::Error::WindowNotFound);
+    }
     platform_impl::focused_window(self)
   }
 
@@ -616,6 +633,15 @@ impl Dispatcher {
 
   /// Sets the cursor position to the specified coordinates.
   pub fn set_cursor_position(&self, point: &Point) -> crate::Result<()> {
+    #[cfg(feature = "test_utils")]
+    if let Some(mock) = &self.mock_focus {
+      mock
+        .lock()
+        .expect("Mock lock.")
+        .operations
+        .push("set_cursor_position".into());
+      return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
       let point = CGPoint {
@@ -639,6 +665,15 @@ impl Dispatcher {
 
   /// Removes focus from the current window and focuses the desktop.
   pub fn reset_focus(&self) -> crate::Result<()> {
+    #[cfg(feature = "test_utils")]
+    if let Some(mock) = &self.mock_focus {
+      mock
+        .lock()
+        .expect("Mock lock.")
+        .operations
+        .push("reset_focus".into());
+      return Ok(());
+    }
     platform_impl::reset_focus(self)
   }
 
