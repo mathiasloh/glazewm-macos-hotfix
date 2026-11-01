@@ -541,6 +541,15 @@ impl Dispatcher {
     &self,
     native_window: &NativeWindow,
   ) -> crate::Result<Display> {
+    #[cfg(feature = "test_utils")]
+    if let Some(mock) = &self.mock_focus {
+      return mock
+        .lock()
+        .expect("Mock lock.")
+        .nearest_display
+        .clone()
+        .ok_or(crate::Error::DisplayNotFound);
+    }
     platform_impl::nearest_display(native_window, self)
   }
 

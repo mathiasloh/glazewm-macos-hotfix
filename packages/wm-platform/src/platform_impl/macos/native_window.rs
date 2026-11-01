@@ -22,7 +22,7 @@ use crate::{
   Dispatcher, Point, Rect, ThreadBound, WindowId,
 };
 
-/// Result of checking a native window ID against WindowServer.
+/// Result of checking a native window ID against `WindowServer`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WindowServerPresence {
   Present,
@@ -31,14 +31,14 @@ enum WindowServerPresence {
   Unavailable,
 }
 
-/// Window identity data returned by WindowServer.
+/// Window identity data returned by `WindowServer`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowServerWindow {
   id: WindowId,
   owner_pid: ProcessId,
 }
 
-/// Determines whether a WindowServer lookup result is safe to keep
+/// Determines whether a `WindowServer` lookup result is safe to keep
 /// managed.
 fn is_valid_window_server_presence(
   presence: WindowServerPresence,
@@ -53,7 +53,7 @@ fn is_valid_window_server_presence(
   }
 }
 
-/// Classifies the WindowServer records for a specific native window.
+/// Classifies the `WindowServer` records for a specific native window.
 fn classify_window_server_presence(
   windows: impl IntoIterator<Item = WindowServerWindow>,
   window_id: WindowId,
@@ -80,7 +80,7 @@ fn classify_window_server_presence(
   }
 }
 
-/// Returns the WindowServer query options and relative window ID.
+/// Returns the `WindowServer` query options and relative window ID.
 ///
 /// Inactive native tabs require `OptionAll`, whose API contract requires
 /// `kCGNullWindowID` (0). The candidate ID remains separate for filtering.
@@ -95,7 +95,7 @@ fn window_server_query_arguments(
   }
 }
 
-/// Gets a numeric value from a WindowServer window description.
+/// Gets a numeric value from a `WindowServer` window description.
 fn window_description_number<'a>(
   description: &'a CFDictionary,
   key: &'static CFString,
@@ -111,7 +111,7 @@ fn window_description_number<'a>(
   unsafe { value.cast::<CFNumber>().as_ref() }
 }
 
-/// Queries whether WindowServer still owns a native window ID for a
+/// Queries whether `WindowServer` still owns a native window ID for a
 /// process.
 fn window_server_presence(
   window_id: WindowId,
@@ -126,7 +126,7 @@ fn window_server_presence(
     return WindowServerPresence::Unavailable;
   };
 
-  let window_descriptions = (&*window_descriptions).as_opaque();
+  let window_descriptions = (*window_descriptions).as_opaque();
   let mut windows = Vec::new();
   let mut has_malformed_target = false;
 
@@ -148,7 +148,7 @@ fn window_server_presence(
       window_description_number(description, kCGWindowNumber)
     };
     let Some(id) = window_number
-      .and_then(|number| number.as_i64())
+      .and_then(objc2_core_foundation::CFNumber::as_i64)
       .and_then(|id| u32::try_from(id).ok())
       .map(WindowId)
     else {
@@ -163,7 +163,7 @@ fn window_server_presence(
       // SAFETY: `kCGWindowOwnerPID` is a framework-provided constant.
       window_description_number(description, kCGWindowOwnerPID)
     };
-    let Some(owner_pid) = owner_pid.and_then(|number| number.as_i32())
+    let Some(owner_pid) = owner_pid.and_then(objc2_core_foundation::CFNumber::as_i32)
     else {
       has_malformed_target = true;
       continue;
@@ -200,6 +200,10 @@ fn is_system_transitioning() -> bool {
   CGDisplayIsAsleep(0) || has_login_window
 }
 
+/// Native identity retained without retaining another window's visit
+/// history.
+type TabVisit = (WindowId, Arc<ThreadBound<CFRetained<AXUIElement>>>);
+
 /// Platform-specific implementation of [`NativeWindow`].
 #[derive(Clone, Debug)]
 pub(crate) struct NativeWindow {
@@ -210,6 +214,7 @@ pub(crate) struct NativeWindow {
   pub(crate) mock_tab:
     Option<Arc<std::sync::Mutex<crate::test_utils::MockTab>>>,
   tab_group: Arc<ThreadBound<RefCell<Option<CFRetained<AXUIElement>>>>>,
+  visited_tabs: Arc<std::sync::Mutex<Vec<TabVisit>>>,
 }
 
 impl NativeWindow {
@@ -228,6 +233,7 @@ impl NativeWindow {
       #[cfg(feature = "test_utils")]
       mock_tab: None,
       tab_group,
+      visited_tabs: Arc::default(),
       element: Arc::new(element),
       id,
       application,
@@ -241,7 +247,16 @@ impl NativeWindow {
   /// detaching or moving a tab cannot keep an observed stale identity.
   pub(crate) fn refresh_tab_group(&self) {
     #[cfg(feature = "test_utils")]
-    if self.mock_tab.is_some() {
+    if let Some(mock) = &self.mock_tab {
+      let mut mock = mock.lock().expect("Mock lock.");
+      if mock.valid {
+        if let Some(group) = mock.queried_group {
+          if group != mock.group || group.is_none() {
+            self.clear_visited_tabs();
+          }
+          mock.group = group;
+        }
+      }
       return;
     }
     if !self.is_valid() {
@@ -274,6 +289,9 @@ impl NativeWindow {
         .ok()
         .flatten();
       if let Ok(cached) = self.tab_group.get_ref() {
+        if *cached.borrow() != group || group.is_none() {
+          self.clear_visited_tabs();
+        }
         *cached.borrow_mut() = group;
       }
     });
@@ -305,6 +323,52 @@ impl NativeWindow {
           }
         })
         .unwrap_or(false)
+  }
+
+  /// Forgets associations when the eligible window leaves its group.
+  fn clear_visited_tabs(&self) {
+    if let Ok(mut visited) = self.visited_tabs.lock() {
+      visited.clear();
+    }
+  }
+
+  /// Copies bounded visit history after the caller proves group equality.
+  pub(crate) fn remember_tab_group_member(&self, previous: &Self) {
+    // ponytail: retain the last 32 visits; older tabs need fresh group
+    // proof.
+    let Ok(mut history) =
+      previous.visited_tabs.lock().map(|ids| ids.clone())
+    else {
+      return;
+    };
+    history.retain(|(id, _)| *id != self.id && *id != previous.id);
+    history.push((previous.id, previous.element.clone()));
+    if history.len() > 32 {
+      history.remove(0);
+    }
+    if let Ok(mut visited) = self.visited_tabs.lock() {
+      *visited = history;
+    }
+  }
+
+  /// Checks only previously associated native IDs, never owner proximity.
+  pub(crate) fn has_visited_tab(&self, candidate: &Self) -> bool {
+    let element = self.visited_tabs.lock().ok().and_then(|visited| {
+      visited
+        .iter()
+        .find(|(id, _)| *id == candidate.id)
+        .map(|(_, element)| element.clone())
+    });
+    element.is_some_and(|element| {
+      element
+        .with(|element| {
+          candidate
+            .element
+            .get_ref()
+            .is_ok_and(|current| current == element)
+        })
+        .unwrap_or(false)
+    })
   }
 
   /// Implements [`NativeWindow::id`].

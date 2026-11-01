@@ -19,7 +19,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) struct Display {
   cg_display_id: CGDirectDisplayID,
-  ns_screen: Arc<ThreadBound<Retained<NSScreen>>>,
+  ns_screen: Option<Arc<ThreadBound<Retained<NSScreen>>>>,
 }
 
 impl Display {
@@ -41,7 +41,7 @@ impl Display {
 
     Ok(Self {
       cg_display_id,
-      ns_screen: Arc::new(ns_screen),
+      ns_screen: Some(Arc::new(ns_screen)),
     })
   }
 
@@ -52,7 +52,7 @@ impl Display {
 
   /// Implements [`Display::name`].
   pub(crate) fn name(&self) -> crate::Result<String> {
-    self.ns_screen.with(|screen| {
+    self.ns_screen().with(|screen| {
       let name = screen.localizedName();
       Ok(name.to_string())
     })?
@@ -86,7 +86,7 @@ impl Display {
       )
     };
 
-    self.ns_screen.with(|screen| {
+    self.ns_screen().with(|screen| {
       // Convert `NSScreen.visibleFrame` into the same coordinate space as
       // `CGDisplayBounds`.
       Ok(appkit_rect_to_cg_rect(
@@ -100,7 +100,7 @@ impl Display {
   pub(crate) fn scale_factor(&self) -> crate::Result<f32> {
     #[allow(clippy::cast_possible_truncation)]
     self
-      .ns_screen
+      .ns_screen()
       .with(|screen| screen.backingScaleFactor() as f32)
   }
 
@@ -153,7 +153,20 @@ impl Display {
 
   /// Implements [`DisplayExtMacOs::ns_screen`].
   pub(crate) fn ns_screen(&self) -> &ThreadBound<Retained<NSScreen>> {
-    &self.ns_screen
+    self
+      .ns_screen
+      .as_deref()
+      .expect("Native screen unavailable in mock.")
+  }
+
+  /// Creates a display identity without a native screen or invalid
+  /// pointers.
+  #[cfg(feature = "test_utils")]
+  pub(crate) fn mock() -> Self {
+    Self {
+      cg_display_id: 0,
+      ns_screen: None,
+    }
   }
 }
 

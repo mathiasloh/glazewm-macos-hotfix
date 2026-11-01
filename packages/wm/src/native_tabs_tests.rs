@@ -16,7 +16,8 @@ use crate::{
     },
     general::platform_sync,
   },
-  models::{NonTilingWindow, Workspace},
+  models::{Monitor, NonTilingWindow, Workspace},
+  traits::PositionGetters,
   wm::WindowManager,
 };
 
@@ -139,6 +140,249 @@ fn assert_replacement_events(
 /// Clears fixtures before shutdown restoration touches native APIs.
 fn clear(workspace: Workspace) {
   detach_container(workspace.into()).expect("Detach workspace.");
+}
+
+/// Fresh group lookup is separate from the identity retained while
+/// inactive.
+#[test]
+fn native_group_query_changes_only_the_eligible_binding() {
+  let window = NativeWindow::mock_tab(WindowId(1), 7, Some(9));
+  let peer = NativeWindow::mock_tab(WindowId(2), 7, Some(9));
+  window.mock_set_valid(false);
+  window.mock_set_queried_tab_group(None);
+  window.refresh_tab_group();
+  assert!(window.has_same_tab_group(&peer));
+  window.mock_set_valid(true);
+  window.refresh_tab_group();
+  assert!(!window.has_same_tab_group(&peer));
+  window.mock_set_queried_tab_group(Some(10));
+  window.refresh_tab_group();
+  let detached = NativeWindow::mock_tab(WindowId(3), 7, Some(10));
+  assert!(window.has_same_tab_group(&detached));
+  assert!(!window.has_same_tab_group(&peer));
+}
+
+/// Closing B after A/B switches retains A's slot without a fresh tab
+/// group. Destruction may precede A's notification, or A may emit no
+/// notification.
+#[test]
+fn finder_last_tab_close_retains_visited_survivor_without_fresh_group() {
+  for (immediate, successor_event) in
+    [(true, false), (true, true), (false, false), (false, true)]
+  {
+    let (mut wm, mut config, workspace, slot, _) = fixture();
+    let b = slot.native().clone();
+    let a = NativeWindow::mock_tab(WindowId(9), 7, Some(9));
+    let id = slot.id();
+    let parent = slot.parent();
+    let order = workspace.children();
+    // The fixture has already admitted B into A's slot. Switch B -> A ->
+    // B.
+    for (inactive, active) in [(&b, &a), (&a, &b)] {
+      inactive.mock_set_valid(false);
+      active.mock_set_valid(true);
+      wm.state
+        .dispatcher
+        .mock_set_focused_window(Some(active.clone()));
+      crate::commands::window::manage_window(
+        active.clone(),
+        None,
+        &mut wm.state,
+        &mut config,
+      )
+      .expect("Switch an existing Finder tab.");
+      assert_eq!(slot.id(), id);
+      assert_eq!(slot.native().id(), active.id());
+    }
+    wm.state.pending_sync.clear();
+    while wm.event_rx.try_recv().is_ok() {}
+    b.mock_set_valid(false);
+    a.mock_set_valid(true);
+    a.mock_set_queried_tab_group(None);
+    b.mock_set_owner_windows(if immediate {
+      vec![a.clone()]
+    } else {
+      vec![]
+    });
+    wm.state.dispatcher.mock_set_focused_window(Some(a.clone()));
+    super::destroyed(b.id(), &mut wm.state, &mut config)
+      .expect("Close only B.");
+    b.mock_set_owner_windows(vec![a.clone()]);
+    if successor_event {
+      // Pausing avoids monitor-dependent sync, not event bookkeeping.
+      wm.state.is_paused = true;
+      wm.process_event(
+        wm_platform::PlatformEvent::Window(WindowEvent::Shown {
+          window: a.clone(),
+          notification: WindowEventNotification(None),
+        }),
+        &mut config,
+      )
+      .expect("Survivor activity after destruction.");
+      wm.state.is_paused = false;
+    }
+    reconcile_due(
+      &mut wm.state,
+      &mut config,
+      Instant::now() + Duration::from_millis(500),
+    )
+    .expect("Resolve close without another native event.");
+    let retained = wm.state.container_by_id(id);
+    // Detach before assertions so a failing regression cannot touch OS
+    // APIs.
+    let actual_order = workspace.children();
+    let actual_parent = slot.parent();
+    let windows = wm.state.windows();
+    let retained_focus = slot.has_focus(None);
+    clear(workspace);
+    assert!(retained.is_some(), "Surviving Finder lost its layout slot.");
+    assert_eq!(slot.native().id(), a.id());
+    assert_eq!(actual_parent, parent);
+    assert_eq!(actual_order, order);
+    assert_eq!(windows.len(), 2);
+    assert!(retained_focus, "Closing a tab moved focus to its sibling.");
+    assert!(!wm.state.pending_sync.needs_focus_update());
+    assert_replacement_events(&mut wm, &slot);
+  }
+}
+
+/// Survivor activity can recover its visited slot before late destruction.
+#[test]
+fn groupless_survivor_activity_before_destroy_retains_visited_slot() {
+  let (mut wm, mut config, workspace, slot, _) = fixture();
+  let b = slot.native().clone();
+  let a = NativeWindow::mock_tab(WindowId(9), 7, None);
+  let id = slot.id();
+  let order = workspace.children();
+  b.mock_set_valid(false);
+  wm.state.dispatcher.mock_set_focused_window(Some(a.clone()));
+  crate::commands::window::manage_window(
+    a.clone(),
+    None,
+    &mut wm.state,
+    &mut config,
+  )
+  .expect("A activity precedes destruction.");
+  super::destroyed(b.id(), &mut wm.state, &mut config)
+    .expect("Late B destruction.");
+  let count = wm.state.windows().len();
+  let actual_order = workspace.children();
+  clear(workspace);
+  assert_eq!(slot.id(), id);
+  assert_eq!(slot.native().id(), a.id());
+  assert_eq!(actual_order, order);
+  assert_eq!(count, 2);
+}
+
+/// Visit proof never authorizes a different group, owner, or unknown
+/// window.
+#[test]
+fn visited_tab_recovery_rejects_unrelated_and_ambiguous_survivors() {
+  for case in [
+    "unknown",
+    "owner",
+    "group",
+    "ignored",
+    "ambiguous",
+    "closed",
+  ] {
+    let (mut wm, mut config, workspace, slot, _) = fixture();
+    let b = slot.native().clone();
+    let visited = NativeWindow::mock_tab(WindowId(9), 7, Some(9));
+    let candidate = NativeWindow::mock_tab(
+      WindowId(if case == "unknown" { 10 } else { 9 }),
+      if case == "owner" { 8 } else { 7 },
+      if case == "group" { Some(10) } else { None },
+    );
+    if case == "ignored" {
+      wm.state.ignored_windows.push(candidate.clone());
+    }
+    let mut inventory = vec![candidate];
+    if case == "ambiguous" {
+      // Both native IDs have positively occupied this same group.
+      b.mock_set_valid(false);
+      wm.state
+        .dispatcher
+        .mock_set_focused_window(Some(visited.clone()));
+      crate::commands::window::manage_window(
+        visited.clone(),
+        None,
+        &mut wm.state,
+        &mut config,
+      )
+      .expect("Visit A.");
+      visited.mock_set_valid(false);
+      b.mock_set_valid(true);
+      wm.state.dispatcher.mock_set_focused_window(Some(b.clone()));
+      crate::commands::window::manage_window(
+        b.clone(),
+        None,
+        &mut wm.state,
+        &mut config,
+      )
+      .expect("Return to B.");
+      inventory.push(NativeWindow::mock_tab(WindowId(11), 7, Some(9)));
+    }
+    if case == "closed" {
+      inventory.clear();
+    }
+    b.mock_set_valid(false);
+    b.mock_set_owner_windows(inventory);
+    super::destroyed(b.id(), &mut wm.state, &mut config)
+      .expect("Close B.");
+    reconcile_due(
+      &mut wm.state,
+      &mut config,
+      Instant::now() + Duration::from_millis(500),
+    )
+    .expect("Resolve rejected inventory.");
+    let count = wm.state.windows().len();
+    let pending = wm.state.pending_native_tabs.len();
+    clear(workspace);
+    assert_eq!(count, 1, "Unexpected successor for {case}.");
+    assert_eq!(pending, 0);
+  }
+}
+
+/// Eligible detachment or regrouping invalidates previously visited
+/// identities.
+#[test]
+fn refreshed_group_change_discards_visited_native_identity() {
+  for group in [None, Some(10)] {
+    let current = NativeWindow::mock_tab(WindowId(1), 7, Some(9));
+    let previous = NativeWindow::mock_tab(WindowId(9), 7, Some(9));
+    current.remember_tab_group_member(&previous);
+    previous.mock_set_tab_group(None);
+    assert!(current.has_visited_tab(&previous));
+    current.mock_set_queried_tab_group(group);
+    current.refresh_tab_group();
+    assert!(!current.has_visited_tab(&previous));
+    // Rejoining the original group cannot resurrect discarded membership.
+    current.mock_set_queried_tab_group(Some(9));
+    current.refresh_tab_group();
+    assert!(!current.has_visited_tab(&previous));
+  }
+}
+
+/// A recovered last tab has no group reservation when its final window
+/// closes.
+#[test]
+fn recovered_groupless_tab_final_close_removes_slot() {
+  let (mut wm, mut config, workspace, slot, _) = fixture();
+  let b = slot.native().clone();
+  let a = NativeWindow::mock_tab(WindowId(9), 7, None);
+  b.mock_set_valid(false);
+  b.mock_set_owner_windows(vec![a.clone()]);
+  super::destroyed(b.id(), &mut wm.state, &mut config).expect("Close B.");
+  let recovered = slot.native().id();
+  a.mock_set_valid(false);
+  super::destroyed(a.id(), &mut wm.state, &mut config).expect("Close A.");
+  let count = wm.state.windows().len();
+  let pending = wm.state.pending_native_tabs.len();
+  clear(workspace);
+  assert_eq!(recovered, a.id());
+  assert_eq!(count, 1);
+  assert_eq!(pending, 0);
 }
 
 /// Owner inventory replaces in place even with stale global focus and no A
@@ -318,6 +562,325 @@ fn reserved_window_is_skipped_by_platform_sync_and_cleanup() {
   assert_eq!(slot.native().mock_operations(), Vec::<String>::new());
   assert_eq!(wm.state.windows().len(), 2);
   clear(workspace);
+}
+
+/// Exercises the same native binding returning after cleanup reserved it.
+/// Other owner activity cannot replace that recovered binding.
+fn assert_recovered_original_retains_slot(
+  activity: bool,
+  candidate_groups: &[Option<u32>],
+) {
+  let (mut wm, mut config, workspace, slot, sibling) = fixture();
+  detach_container(workspace.clone().into()).expect("Reparent workspace.");
+  let monitor = Monitor::mock().workspaces(vec![workspace.clone()]).call();
+  attach_container(
+    &monitor.clone().into(),
+    &wm.state.root_container.clone().into(),
+    None,
+  )
+  .expect("Attach mock monitor for recovery redraw.");
+  config.value.general.cursor_jump.enabled = false;
+  let original = slot.native().clone();
+  let id = slot.id();
+  let parent = slot.parent();
+  let order = workspace.children();
+  let focus_order = workspace.descendant_focus_order().collect::<Vec<_>>();
+  let rect = slot.to_rect().expect("Original allocation.");
+  let sibling_rect = sibling.to_rect().expect("Sibling allocation.");
+  original.mock_set_valid(false);
+  wm.state
+    .cleanup_invalid_windows()
+    .expect("Reserve inactive original.");
+  assert!(wm.state.native_binding_reserved(&slot));
+  let started = wm.state.pending_native_tabs[0].started;
+  probe_new(&mut wm.state, &mut config, &[])
+    .expect("Immediate probe has no successor.");
+
+  let candidates = candidate_groups
+    .iter()
+    .enumerate()
+    .map(|(index, group)| {
+      NativeWindow::mock_tab(WindowId(30 + index as u32), 7, *group)
+    })
+    .collect::<Vec<_>>();
+  original.mock_set_owner_windows(candidates.clone());
+  for candidate in &candidates {
+    assert!(!original.has_visited_tab(candidate));
+    wm.process_event(
+      wm_platform::PlatformEvent::Window(WindowEvent::Shown {
+        window: candidate.clone(),
+        notification: WindowEventNotification(None),
+      }),
+      &mut config,
+    )
+    .expect("Hold transient owner activity.");
+  }
+  assert_eq!(wm.state.deferred_native_tab_windows.len(), candidates.len());
+
+  // No replacement ID or destruction event: the original itself returns.
+  original.mock_set_valid(true);
+  original.mock_set_queried_tab_group(None);
+  if activity {
+    // Do not mistake legitimate ordinary replay for stealing the slot.
+    // Without activity, candidates stay valid through the deadline probe.
+    for candidate in &candidates {
+      candidate.mock_set_valid(false);
+    }
+    wm.process_event(
+      wm_platform::PlatformEvent::Window(WindowEvent::Shown {
+        window: original.clone(),
+        notification: WindowEventNotification(None),
+      }),
+      &mut config,
+    )
+    .expect("Original becomes shown again.");
+  }
+  let released_on_activity = !wm.state.native_binding_reserved(&slot);
+  reconcile_due(
+    &mut wm.state,
+    &mut config,
+    started + Duration::from_millis(500),
+  )
+  .expect("Resolve original recovery at deadline.");
+
+  // Transient candidates disappear before ordinary replay. Without return
+  // activity, they were still valid at the deadline reconciliation.
+  for candidate in &candidates {
+    candidate.mock_set_valid(false);
+  }
+  replay_ready(&mut wm.state, &mut config);
+  let retained =
+    wm.state.window_from_native(&original) == Some(slot.clone());
+  let actual_id = slot.id();
+  let actual_native_id = slot.native().id();
+  let actual_parent = slot.parent();
+  let actual_order = workspace.children();
+  let actual_focus_order =
+    workspace.descendant_focus_order().collect::<Vec<_>>();
+  let actual_rect = slot.to_rect().expect("Recovered allocation.");
+  let actual_sibling_rect =
+    sibling.to_rect().expect("Sibling allocation.");
+  let count = wm.state.windows().len();
+  let reserved = wm.state.native_binding_reserved(&slot);
+  let settled = deadline(&wm.state).is_none();
+  let focused = slot.has_focus(None);
+  let focus_requested = wm.state.pending_sync.needs_focus_update();
+  let effects_requested =
+    wm.state.pending_sync.needs_focused_effect_update()
+      || wm.state.prev_effects_window.as_ref() == Some(&slot);
+  platform_sync(&mut wm.state, &config).expect("Resume recovery redraw.");
+  let operations = original.mock_operations();
+  let unmanaged = std::iter::from_fn(|| wm.event_rx.try_recv().ok())
+    .filter(|event| matches!(event, WmEvent::WindowUnmanaged { .. }))
+    .count();
+  let groupless = !original.has_same_tab_group(&original);
+
+  // A later real final close must not inherit the old group reservation.
+  original.mock_set_valid(false);
+  original.mock_set_owner_windows(vec![]);
+  super::destroyed(original.id(), &mut wm.state, &mut config)
+    .expect("Close recovered original.");
+  let final_count = wm.state.windows().len();
+  let final_settled = deadline(&wm.state).is_none();
+  let final_unmanaged = std::iter::from_fn(|| wm.event_rx.try_recv().ok())
+    .filter(|event| matches!(event, WmEvent::WindowUnmanaged { .. }))
+    .count();
+  clear(workspace);
+  detach_container(monitor.into()).expect("Detach mock monitor.");
+
+  assert!(retained, "Recovered original lost its existing slot.");
+  assert_eq!(actual_id, id);
+  assert_eq!(actual_native_id, original.id());
+  assert_eq!(actual_parent, parent);
+  assert_eq!(actual_order, order);
+  assert_eq!(actual_focus_order, focus_order);
+  assert_eq!(actual_rect, rect);
+  assert_eq!(actual_sibling_rect, sibling_rect);
+  assert_eq!(count, 2);
+  assert!(
+    !reserved && settled,
+    "Recovery left a reservation or deferred work."
+  );
+  assert!(
+    !activity || released_on_activity,
+    "Shown original stayed reserved."
+  );
+  assert!(focused && !focus_requested, "Recovery shifted focus.");
+  assert_eq!(unmanaged, 0, "Recovery published an ordinary close.");
+  assert!(
+    effects_requested,
+    "Recovery did not resume focused effects."
+  );
+  assert!(operations.iter().any(|operation| operation == "set_frame"));
+  assert!(!operations.iter().any(|operation| operation == "focus"));
+  assert!(groupless, "Recovery retained stale native group identity.");
+  assert_eq!(final_count, 1);
+  assert!(final_settled);
+  assert_eq!(
+    final_unmanaged, 1,
+    "Final close must unmanage exactly once."
+  );
+}
+
+/// Shown activity releases the recovered original before its old deadline.
+#[test]
+fn recovered_original_activity_retains_slot() {
+  assert_recovered_original_retains_slot(true, &[]);
+}
+
+/// Recovery must not depend on delivery of another native notification.
+#[test]
+fn recovered_original_without_activity_retains_slot() {
+  assert_recovered_original_retains_slot(false, &[]);
+}
+
+/// An unvisited groupless candidate cannot steal the returning original.
+#[test]
+fn recovered_original_rejects_unvisited_transient_candidate() {
+  for activity in [false, true] {
+    assert_recovered_original_retains_slot(activity, &[None]);
+  }
+}
+
+/// Ambiguous same-group candidates cannot displace a recovered original.
+#[test]
+fn recovered_original_rejects_ambiguous_transient_candidates() {
+  for activity in [false, true] {
+    assert_recovered_original_retains_slot(activity, &[Some(9), Some(9)]);
+  }
+}
+
+/// Recovery preserves newer focus unless the native focus still confirms
+/// the recovered window. Focus rules record any forwarded notification.
+fn assert_recovered_focus_uses_current_native_focus(
+  current_focus: WindowId,
+) {
+  let (mut wm, _, workspace, slot, sibling) = fixture();
+  detach_container(workspace.clone().into()).expect("Reparent workspace.");
+  let monitor = Monitor::mock().workspaces(vec![workspace.clone()]).call();
+  attach_container(
+    &monitor.clone().into(),
+    &wm.state.root_container.clone().into(),
+    None,
+  )
+  .expect("Attach mock monitor for recovery sync.");
+  let mut config = UserConfig::for_testing(vec![WindowRuleConfig {
+    commands: vec![InvokeCommand::WmDisableBindingMode {
+      name: "focus-rule-marker".into(),
+    }],
+    match_window: vec![WindowMatchConfig::default()],
+    on: vec![WindowRuleEvent::Focus],
+    run_once: false,
+  }]);
+  config.value.general.cursor_jump.enabled = false;
+  let original = slot.native().clone();
+  original.mock_set_valid(false);
+  wm.state
+    .cleanup_invalid_windows()
+    .expect("Reserve original.");
+  assert!(wm.state.native_binding_reserved(&slot));
+
+  // A newer WM selection has already superseded the queued notification.
+  set_focused_descendant(&sibling.clone().into(), None);
+  let native_focus = if current_focus == original.id() {
+    original.clone()
+  } else if current_focus == sibling.native().id() {
+    sibling.native().clone()
+  } else {
+    // An unmanaged external app can own native focus without replacing
+    // the last selected WM container.
+    NativeWindow::mock_tab(current_focus, 99, None)
+  };
+  wm.state
+    .dispatcher
+    .mock_set_focused_window(Some(native_focus));
+  wm.state.pending_sync.clear();
+  while wm.event_rx.try_recv().is_ok() {}
+  let order = workspace.children();
+  let focus_order = workspace.descendant_focus_order().collect::<Vec<_>>();
+  let id = slot.id();
+  original.mock_set_valid(true);
+  original.mock_set_queried_tab_group(None);
+  wm.process_event(
+    wm_platform::PlatformEvent::Window(WindowEvent::Focused {
+      window: original.clone(),
+      notification: WindowEventNotification(None),
+    }),
+    &mut config,
+  )
+  .expect("Deliver recovered window's delayed focus notification.");
+
+  let retained =
+    wm.state.window_from_native(&original) == Some(slot.clone());
+  let reserved = wm.state.native_binding_reserved(&slot);
+  let settled = deadline(&wm.state).is_none();
+  let sibling_focused = sibling.has_focus(None);
+  let original_focused = slot.has_focus(None);
+  let actual_order = workspace.children();
+  let actual_focus_order =
+    workspace.descendant_focus_order().collect::<Vec<_>>();
+  let mut focus_events = Vec::new();
+  let mut focus_rule_runs = 0;
+  let mut unmanaged = 0;
+  while let Ok(event) = wm.event_rx.try_recv() {
+    match event {
+      WmEvent::FocusChanged {
+        focused_container: ContainerDto::Window(dto),
+      } => {
+        focus_events.push(dto.id);
+      }
+      WmEvent::BindingModesChanged { .. } => focus_rule_runs += 1,
+      WmEvent::WindowUnmanaged { .. } => unmanaged += 1,
+      _ => {}
+    }
+  }
+  let operations = original.mock_operations();
+  clear(workspace);
+  detach_container(monitor.into()).expect("Detach mock monitor.");
+
+  assert!(
+    retained && !reserved && settled,
+    "Original did not recover."
+  );
+  assert_eq!(actual_order, order);
+  assert_eq!(unmanaged, 0);
+  if current_focus == original.id() {
+    assert!(original_focused && !sibling_focused);
+    assert_eq!(focus_events, vec![id]);
+    assert_eq!(focus_rule_runs, 1);
+  } else {
+    assert!(
+      sibling_focused && !original_focused,
+      "Stale recovery stole WM focus."
+    );
+    assert_eq!(actual_focus_order, focus_order);
+    assert!(
+      focus_events.is_empty(),
+      "Stale notification published focus."
+    );
+    assert_eq!(focus_rule_runs, 0, "Stale notification ran Focus rules.");
+    assert!(!operations.iter().any(|operation| operation == "focus"));
+  }
+}
+
+/// A newer managed sibling's native focus overrides a queued notification.
+#[test]
+fn recovered_focused_notification_preserves_newer_sibling_focus() {
+  assert_recovered_focus_uses_current_native_focus(WindowId(2));
+}
+
+/// An external application's current native focus is not recovery
+/// authority.
+#[test]
+fn recovered_focused_notification_preserves_external_native_focus() {
+  assert_recovered_focus_uses_current_native_focus(WindowId(77));
+}
+
+/// A current native focus notification must still reach ordinary Focus
+/// rules.
+#[test]
+fn recovered_focused_notification_accepts_current_native_focus() {
+  assert_recovered_focus_uses_current_native_focus(WindowId(1));
 }
 
 /// One inconclusive deadline performs ordinary close once, even paused.

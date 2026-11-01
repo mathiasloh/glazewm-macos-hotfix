@@ -64,6 +64,58 @@ pub(crate) fn is_reserved(
   })
 }
 
+/// Releases a reservation when its retained native binding is eligible
+/// again.
+///
+/// Validate the retained AX element, not an event or owner-inventory
+/// candidate. Recovery changes neither native identity nor layout or
+/// Manage-rule history.
+pub(crate) fn recover_original(
+  window: &WindowContainer,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> bool {
+  let Some(original) = state
+    .pending_native_tabs
+    .iter()
+    .find(|pending| {
+      let native = window.native();
+      pending.id == window.id()
+        && pending.original.id() == native.id()
+        && pending.original.has_same_owner(&native)
+        && std::ptr::eq(
+          pending.original.ax_ui_element(),
+          native.ax_ui_element(),
+        )
+    })
+    .map(|pending| pending.original.clone())
+  else {
+    return false;
+  };
+  if !original.is_valid() || state.ignored_windows.contains(&original) {
+    return false;
+  }
+  let Some(properties) = check_is_manageable(&original).ok().flatten()
+  else {
+    return false;
+  };
+  if !native_tab_allowed(&original, &properties, config) {
+    return false;
+  }
+  original.refresh_tab_group();
+  window.update_native_properties(|cached| *cached = properties);
+  state
+    .pending_native_tabs
+    .retain(|pending| pending.id != window.id());
+  state.pending_sync.queue_container_to_redraw(window.clone());
+  if window.has_focus(None) {
+    state.pending_sync.queue_focused_effect_update();
+  } else {
+    state.pending_sync.queue_all_effects_update();
+  }
+  true
+}
+
 /// Finds the one eligible same-owner/group successor, never normal
 /// admission.
 fn successor(
@@ -83,7 +135,9 @@ fn successor(
       return None;
     }
     candidate.refresh_tab_group();
-    if !candidate.has_same_tab_group(original) {
+    if !candidate.has_same_tab_group(original)
+      && !original.has_visited_tab(&candidate)
+    {
       return None;
     }
     let properties = check_is_manageable(&candidate).ok()??;
@@ -104,10 +158,14 @@ fn replace(
   state: &mut WmState,
   config: &mut UserConfig,
 ) -> anyhow::Result<bool> {
+  if recover_original(&window, state, config) {
+    return Ok(true);
+  }
   let Some((native, properties)) = successor(original, state, config)
   else {
     return Ok(false);
   };
+  native.remember_tab_group_member(original);
   window.replace_native(native, properties);
   // Remove the reservation before Manage rules can detach or transform U.
   state
@@ -207,7 +265,7 @@ pub(crate) fn blocks_admission(
   // positively matching groups, without recording an unbounded event log.
   state
     .deferred_native_tab_windows
-    .retain(|window| window.is_alive());
+    .retain(wm_platform::NativeWindowExtMacOs::is_alive);
   if !state.deferred_native_tab_windows.contains(native)
     && native.is_alive()
   {

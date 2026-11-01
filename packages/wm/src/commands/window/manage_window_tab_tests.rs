@@ -48,6 +48,163 @@ fn clear(workspace: Workspace) {
   detach_container(workspace.into()).expect("Detach fixture.");
 }
 
+/// Adds a safe native monitor boundary for real ordinary admission.
+fn admission_fixture() -> (WmState, Workspace, Monitor) {
+  let (state, _, workspace) = fixture();
+  detach_container(workspace.clone().into()).expect("Reparent workspace.");
+  let monitor = Monitor::mock().workspaces(vec![workspace.clone()]).call();
+  state.dispatcher.mock_set_nearest_display(monitor.native());
+  attach_container(
+    &monitor.clone().into(),
+    &state.root_container.clone().into(),
+    None,
+  )
+  .expect("Attach monitor.");
+  (state, workspace, monitor)
+}
+
+/// Ordinary admission must not allocate both an ineligible groupless tab
+/// and its newly shown successor while waiting for periodic cleanup.
+#[test]
+fn ordinary_admission_drops_stale_groupless_allocation_before_sync() {
+  let (mut state, workspace, monitor) = admission_fixture();
+  let old = NativeWindow::mock_tab(WindowId(1), 7, None);
+  let stale: WindowContainer =
+    TilingWindow::mock().native(old.clone()).call().into();
+  attach(&stale, &workspace);
+  for id in [2, 3] {
+    attach(
+      &TilingWindow::mock()
+        .native(NativeWindow::mock_tab(WindowId(id), 8, None))
+        .call()
+        .into(),
+      &workspace,
+    );
+  }
+  set_focused_descendant(&stale.clone().into(), None);
+  // AX lifetime survives, but the ordinary cleanup predicate rejects A.
+  // No group, owner, title, or frame correlation proves A and B related.
+  old.mock_set_valid(false);
+  let candidate = NativeWindow::mock_tab(WindowId(4), 7, Some(9));
+  state
+    .dispatcher
+    .mock_set_focused_window(Some(candidate.clone()));
+  let mut config = UserConfig::for_testing(vec![]);
+  config.value.general.cursor_jump.enabled = false;
+  manage_window(candidate.clone(), None, &mut state, &mut config)
+    .expect("Admit B through the real ordinary creation path.");
+  crate::commands::general::platform_sync(&mut state, &config)
+    .expect("Flush the admission redraw without a cleanup timer.");
+  let admitted = state.window_from_native(&candidate).is_some();
+  let stale_allocated = state.window_from_native(&old).is_some();
+  let allocations = workspace
+    .tiling_children()
+    .map(|window| window.to_rect().expect("Allocated tile."))
+    .collect::<Vec<_>>();
+  let synced = candidate.mock_operations();
+  clear(workspace);
+  detach_container(monitor.into()).expect("Detach monitor.");
+  assert!(admitted, "The fixture must reach ordinary B admission.");
+  assert!(
+    synced.iter().any(|operation| operation == "set_frame"),
+    "The fixture must reach the native admission redraw."
+  );
+  assert_eq!(
+    allocations.len(),
+    3,
+    "Single admission/sync allocated a blank fourth tile: {allocations:?}"
+  );
+  assert!(!stale_allocated, "Ineligible A still owns a layout slot.");
+}
+
+/// Cleanup discovered during admission reserves a positively grouped old
+/// binding and defers unproven same-owner activity instead of stealing it.
+#[test]
+fn ordinary_admission_reserves_grouped_binding_without_unproven_replacement(
+) {
+  let (mut state, workspace, monitor) = admission_fixture();
+  let old = NativeWindow::mock_tab(WindowId(1), 7, Some(9));
+  let slot: WindowContainer =
+    TilingWindow::mock().native(old.clone()).call().into();
+  attach(&slot, &workspace);
+  set_focused_descendant(&slot.clone().into(), None);
+  old.mock_set_valid(false);
+  let candidate = NativeWindow::mock_tab(WindowId(2), 7, Some(10));
+  state
+    .dispatcher
+    .mock_set_focused_window(Some(candidate.clone()));
+  manage_window(
+    candidate.clone(),
+    None,
+    &mut state,
+    &mut UserConfig::for_testing(vec![]),
+  )
+  .expect("Unproven admission.");
+  let retained = state.window_from_native(&old) == Some(slot.clone());
+  let admitted = state.window_from_native(&candidate).is_some();
+  let reserved = state.native_binding_reserved(&slot);
+  let deferred = state.deferred_native_tab_windows.clone();
+  clear(workspace);
+  detach_container(monitor.into()).expect("Detach monitor.");
+  assert!(
+    retained && reserved,
+    "Positive group proof must retain its slot."
+  );
+  assert!(
+    !admitted,
+    "Unproven same-owner candidate must not steal a slot."
+  );
+  assert_eq!(deferred, vec![candidate]);
+}
+
+/// Ordinary cleanup uses native validity, not minimization or workspace
+/// visibility, when admitting an unrelated new window.
+#[test]
+fn ordinary_admission_retains_valid_minimized_and_offworkspace_windows() {
+  let (mut state, workspace, monitor) = admission_fixture();
+  let minimized: WindowContainer = NonTilingWindow::mock()
+    .native(NativeWindow::mock_tab(WindowId(1), 7, None))
+    .state(WindowState::Minimized)
+    .call()
+    .into();
+  attach(&minimized, &workspace);
+  let hidden = Workspace::mock().name("2".into()).call();
+  attach_container(&hidden.clone().into(), &monitor.clone().into(), None)
+    .expect("Attach inactive workspace.");
+  let offworkspace: WindowContainer = TilingWindow::mock()
+    .native(NativeWindow::mock_tab(WindowId(2), 7, None))
+    .call()
+    .into();
+  attach(&offworkspace, &hidden);
+  set_focused_descendant(&workspace.clone().into(), None);
+  assert!(
+    !hidden.is_displayed(),
+    "Fixture must use an inactive workspace."
+  );
+  let candidate = NativeWindow::mock_tab(WindowId(3), 8, None);
+  state
+    .dispatcher
+    .mock_set_focused_window(Some(candidate.clone()));
+  manage_window(
+    candidate.clone(),
+    None,
+    &mut state,
+    &mut UserConfig::for_testing(vec![]),
+  )
+  .expect("Ordinary admission.");
+  let minimized_retained = state.window_from_native(&minimized.native())
+    == Some(minimized.clone());
+  let hidden_retained = state.window_from_native(&offworkspace.native())
+    == Some(offworkspace.clone());
+  let admitted = state.window_from_native(&candidate).is_some();
+  clear(workspace);
+  clear(hidden);
+  detach_container(monitor.into()).expect("Detach monitor.");
+  assert!(admitted, "The new eligible window must still be admitted.");
+  assert!(minimized_retained && hidden_retained);
+  assert_eq!(minimized.state(), WindowState::Minimized);
+}
+
 /// Tests nested 70/30 layout retention, including sibling and focus order.
 #[test]
 fn native_tab_replacement_preserves_nested_layout_and_native_lookup() {

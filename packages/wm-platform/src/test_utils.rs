@@ -17,10 +17,23 @@ pub use crate::{Dispatcher, Display, NativeWindow};
 #[derive(Debug, Default)]
 pub(crate) struct MockDispatcher {
   pub(crate) focus: Option<NativeWindow>,
+  pub(crate) nearest_display: Option<Display>,
   pub(crate) operations: Vec<String>,
 }
 
 impl Dispatcher {
+  /// Sets the display returned by native window admission without OS
+  /// access.
+  pub fn mock_set_nearest_display(&self, display: Display) {
+    self
+      .mock_focus
+      .as_ref()
+      .expect("Mock dispatcher.")
+      .lock()
+      .expect("Mock lock.")
+      .nearest_display = Some(display);
+  }
+
   /// Returns native dispatcher operations requested by production sync.
   pub fn mock_operations(&self) -> Vec<String> {
     self
@@ -60,6 +73,7 @@ impl Dispatcher {
 pub(crate) struct MockTab {
   pub(crate) owner: i32,
   pub(crate) group: Option<u32>,
+  pub(crate) queried_group: Option<Option<u32>>,
   pub(crate) valid: bool,
   pub(crate) owner_windows: Vec<NativeWindow>,
   pub(crate) enumeration_failed: bool,
@@ -76,6 +90,7 @@ impl NativeWindow {
       Some(Arc::new(std::sync::Mutex::new(MockTab {
         owner,
         group,
+        queried_group: None,
         valid: true,
         owner_windows: Vec::new(),
         enumeration_failed: false,
@@ -98,7 +113,7 @@ impl NativeWindow {
       .valid = valid;
   }
 
-  /// Changes the freshly queryable group independently of owner inventory.
+  /// Changes the retained group identity independently of owner inventory.
   #[cfg(target_os = "macos")]
   pub fn mock_set_tab_group(&self, group: Option<u32>) {
     self
@@ -109,6 +124,19 @@ impl NativeWindow {
       .lock()
       .expect("Mock lock.")
       .group = group;
+  }
+
+  /// Sets the next group query without changing the retained identity.
+  #[cfg(target_os = "macos")]
+  pub fn mock_set_queried_tab_group(&self, group: Option<u32>) {
+    self
+      .inner
+      .mock_tab
+      .as_ref()
+      .expect("Mock tab.")
+      .lock()
+      .expect("Mock lock.")
+      .queried_group = Some(group);
   }
 
   /// Sets a fresh owner inventory independently of global focus.
@@ -192,6 +220,7 @@ impl NativeWindow {
       window.mock_tab = Some(Arc::new(std::sync::Mutex::new(MockTab {
         owner: 0,
         group: None,
+        queried_group: None,
         valid: true,
         owner_windows: Vec::new(),
         enumeration_failed: false,
@@ -212,8 +241,7 @@ impl Display {
       #[cfg(target_os = "windows")]
       inner: platform_impl::Display::new(0),
       #[cfg(target_os = "macos")]
-      #[allow(invalid_value)]
-      inner: unsafe { std::mem::zeroed() },
+      inner: platform_impl::Display::mock(),
     }
   }
 }

@@ -38,7 +38,7 @@ const WINE_HELPER_PROCESS_NAMES: &[&str] = &[
   "wineserver",
 ];
 
-/// Returns whether an application has a known CrossOver or Wine helper
+/// Returns whether an application has a known `CrossOver` or Wine helper
 /// identity.
 fn is_crossover_wine_helper_identity(
   bundle_id: Option<&str>,
@@ -147,7 +147,7 @@ impl Application {
       .map(|ns_string| ns_string.to_string())
   }
 
-  /// Returns whether the application is a recognized CrossOver or Wine
+  /// Returns whether the application is a recognized `CrossOver` or Wine
   /// helper.
   pub(crate) fn is_crossover_wine_helper(&self) -> bool {
     is_crossover_wine_helper_identity(

@@ -122,15 +122,32 @@ impl WindowManager {
 
     #[cfg(target_os = "macos")]
     if let PlatformEvent::Window(window_event) = &event {
-      // Late Hidden/minimize/property notifications cannot detach or
-      // mutate a reserved dead binding before its replace-or-close
-      // deadline.
-      if window_event
+      // A retained binding may become eligible again before its deadline.
+      // Otherwise, late activity must not mutate the reserved dead
+      // binding.
+      if let Some(managed) = window_event
         .window()
         .and_then(|native| state.window_from_native(native))
-        .is_some_and(|managed| state.native_binding_reserved(&managed))
       {
-        return Ok(());
+        if state.native_binding_reserved(&managed) {
+          if !crate::native_tabs::recover_original(&managed, state, config)
+          {
+            return Ok(());
+          }
+          // Recovery is not focus authority: a newer native focus may
+          // have superseded this queued notification.
+          if matches!(window_event, WindowEvent::Focused { .. })
+            && !state
+              .dispatcher
+              .focused_window()
+              .is_ok_and(|focused| focused == *managed.native())
+          {
+            if !state.is_paused && state.pending_sync.has_changes() {
+              platform_sync(state, config)?;
+            }
+            return Ok(());
+          }
+        }
       }
       // Hold unowned same-owner activity until the reserved slot resolves,
       // rather than creating a duplicate or running focus-stealing

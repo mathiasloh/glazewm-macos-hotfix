@@ -87,15 +87,25 @@ fn manage_window_with_focus(
   let replacement: Option<WindowContainer> = None;
 
   // Create only when no unique inactive tab can retain this layout slot.
-  let window = match replacement {
-    Some(window) => window,
-    None => try_warn!(create_window(
+  let window = if let Some(window) = replacement {
+    window
+  } else {
+    #[cfg(target_os = "macos")]
+    {
+      // Remove ordinary stale allocations before creating a new tile.
+      // Group-backed slots retain the existing reservation policy.
+      state.cleanup_invalid_windows()?;
+      if crate::native_tabs::blocks_admission(&native_window, state) {
+        return Ok(());
+      }
+    }
+    try_warn!(create_window(
       native_window,
       native_properties,
       target_parent,
       state,
       config
-    )),
+    ))
   };
 
   if take_focus {
@@ -190,9 +200,13 @@ fn replace_native_tab(
     return None;
   }
 
+  use wm_platform::NativeWindowExtMacOs;
+
   let windows = state.windows();
   let mut matches = windows.into_iter().filter(|window| {
-    !is_valid(&window.native()) && same_group(&window.native())
+    !is_valid(&window.native())
+      && (same_group(&window.native())
+        || window.native().has_visited_tab(native))
   });
   let window = matches.next()?;
   if matches.next().is_some() {
@@ -203,6 +217,7 @@ fn replace_native_tab(
     return None;
   }
 
+  native.remember_tab_group_member(&window.native());
   window.replace_native(native.clone(), properties.clone());
   Some(window)
 }

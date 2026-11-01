@@ -26,9 +26,7 @@ pub fn platform_sync(
     state.focused_container().context("No focused container.")?;
 
   let focused_reserved = focused_container
-    .as_window_container()
-    .ok()
-    .is_some_and(|window| state.native_binding_reserved(&window));
+    .as_window_container().is_ok_and(|window| state.native_binding_reserved(&window));
 
   if state.pending_sync.needs_focus_update() && !focused_reserved {
     sync_focus(&focused_container, state)?;

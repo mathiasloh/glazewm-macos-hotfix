@@ -71,7 +71,7 @@ pub trait NativeWindowExtMacOs {
   /// This method is only available on macOS.
   fn bundle_id(&self) -> Option<String>;
 
-  /// Returns whether the owning application is a recognized CrossOver or
+  /// Returns whether the owning application is a recognized `CrossOver` or
   /// Wine helper.
   ///
   /// # Platform-specific
@@ -107,7 +107,7 @@ pub trait NativeWindowExtMacOs {
   /// This method is only available on macOS.
   fn is_main(&self) -> crate::Result<bool>;
 
-  /// Whether WindowServer still owns this ID for its application,
+  /// Whether `WindowServer` still owns this ID for its application,
   /// including inactive native tabs.
   ///
   /// Unlike `is_valid`, this checks lifetime rather than eligibility for
@@ -120,6 +120,13 @@ pub trait NativeWindowExtMacOs {
 
   /// Whether both windows have the same retained native tab group.
   fn has_same_tab_group(&self, other: &NativeWindow) -> bool;
+
+  /// Retains bounded native visits only after a proven same-group swap.
+  fn remember_tab_group_member(&self, previous: &NativeWindow);
+
+  /// Whether a groupless candidate previously occupied this native group.
+  /// Callers must refresh the candidate before using this fallback.
+  fn has_visited_tab(&self, candidate: &NativeWindow) -> bool;
 
   /// Whether both windows belong to the same owning process.
   fn has_same_owner(&self, other: &NativeWindow) -> bool;
@@ -161,6 +168,19 @@ impl NativeWindowExtMacOs for NativeWindow {
 
   fn has_same_tab_group(&self, other: &NativeWindow) -> bool {
     self.inner.has_same_tab_group(&other.inner)
+  }
+
+  fn remember_tab_group_member(&self, previous: &NativeWindow) {
+    if self.has_same_tab_group(previous) {
+      self.inner.remember_tab_group_member(&previous.inner);
+    }
+  }
+
+  fn has_visited_tab(&self, candidate: &NativeWindow) -> bool {
+    self.has_same_owner(candidate)
+      && self.has_same_tab_group(self)
+      && !candidate.has_same_tab_group(candidate)
+      && self.inner.has_visited_tab(&candidate.inner)
   }
 
   fn is_alive(&self) -> bool {
